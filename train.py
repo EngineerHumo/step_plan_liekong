@@ -1,6 +1,6 @@
 import argparse
 import os
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -36,11 +36,14 @@ def tensor_to_image(tensor: torch.Tensor) -> "np.ndarray":  # type: ignore[name-
 def save_validation_batch(
     images: torch.Tensor,
     heatmaps: torch.Tensor,
-    masks: torch.Tensor,
-    preds: torch.Tensor,
+    masks1: torch.Tensor,
+    masks2: torch.Tensor,
+    preds1: torch.Tensor,
+    preds2: torch.Tensor,
     save_root: str,
     epoch: int,
     batch_idx: int,
+    original_size: Tuple[int, int] = (1240, 1240),
 ) -> None:
     import cv2
     import numpy as np
@@ -51,21 +54,40 @@ def save_validation_batch(
     for i in range(images.shape[0]):
         image_np = tensor_to_image(images[i])
         heatmap_np = heatmaps[i, 0].detach().cpu().numpy()
-        mask_np = masks[i, 0].detach().cpu().numpy()
-        pred_np = preds[i, 0].detach().cpu().numpy()
+        mask1_np = masks1[i, 0].detach().cpu().numpy()
+        mask2_np = masks2[i, 0].detach().cpu().numpy()
+        pred1_np = preds1[i, 0].detach().cpu().numpy()
+        pred2_np = preds2[i, 0].detach().cpu().numpy()
 
         click_y, click_x = divmod(heatmap_np.argmax(), heatmap_np.shape[1])
-        image_with_click = image_np.copy()
-        cv2.circle(image_with_click, (int(click_x), int(click_y)), 8, (255, 0, 0), thickness=-1)
+        scale_y = original_size[0] / heatmap_np.shape[0]
+        scale_x = original_size[1] / heatmap_np.shape[1]
+        click_y_resized = int(click_y * scale_y)
+        click_x_resized = int(click_x * scale_x)
 
-        pred_mask = (pred_np > 0.5).astype(np.uint8) * 255
-        gt_mask = (mask_np > 0.5).astype(np.uint8) * 255
+        image_resized = cv2.resize(image_np, (original_size[1], original_size[0]))
+        heatmap_resized = cv2.resize(heatmap_np, (original_size[1], original_size[0]))
+        mask1_resized = cv2.resize(mask1_np, (original_size[1], original_size[0]), interpolation=cv2.INTER_NEAREST)
+        mask2_resized = cv2.resize(mask2_np, (original_size[1], original_size[0]), interpolation=cv2.INTER_NEAREST)
+        pred1_resized = cv2.resize(pred1_np, (original_size[1], original_size[0]))
+        pred2_resized = cv2.resize(pred2_np, (original_size[1], original_size[0]))
+
+        image_with_click = image_resized.copy()
+        cv2.circle(image_with_click, (int(click_x_resized), int(click_y_resized)), 8, (255, 0, 0), thickness=-1)
+
+        pred1_mask = (pred1_resized > 0.5).astype(np.uint8) * 255
+        pred2_mask = (pred2_resized > 0.5).astype(np.uint8) * 255
+        gt1_mask = (mask1_resized > 0.5).astype(np.uint8) * 255
+        gt2_mask = (mask2_resized > 0.5).astype(np.uint8) * 255
 
         basename = f"sample_{batch_idx:03d}_{i:02d}"
-        cv2.imwrite(os.path.join(epoch_dir, f"{basename}_image.png"), cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR))
+        cv2.imwrite(os.path.join(epoch_dir, f"{basename}_image.png"), cv2.cvtColor(image_resized, cv2.COLOR_RGB2BGR))
         cv2.imwrite(os.path.join(epoch_dir, f"{basename}_click.png"), cv2.cvtColor(image_with_click, cv2.COLOR_RGB2BGR))
-        cv2.imwrite(os.path.join(epoch_dir, f"{basename}_pred.png"), pred_mask)
-        cv2.imwrite(os.path.join(epoch_dir, f"{basename}_gt.png"), gt_mask)
+        cv2.imwrite(os.path.join(epoch_dir, f"{basename}_heatmap.png"), (heatmap_resized * 255).astype(np.uint8))
+        cv2.imwrite(os.path.join(epoch_dir, f"{basename}_pred1.png"), pred1_mask)
+        cv2.imwrite(os.path.join(epoch_dir, f"{basename}_pred2.png"), pred2_mask)
+        cv2.imwrite(os.path.join(epoch_dir, f"{basename}_gt1.png"), gt1_mask)
+        cv2.imwrite(os.path.join(epoch_dir, f"{basename}_gt2.png"), gt2_mask)
 
 
 def dice_bce_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -86,20 +108,23 @@ def evaluate(
     dice_scores = []
     iou_scores = []
     with torch.no_grad():
-        for batch_idx, (images, heatmaps, masks) in enumerate(loader):
+        for batch_idx, (images, heatmaps, masks1, masks2) in enumerate(loader):
             images = images.to(device)
             heatmaps = heatmaps.to(device)
-            masks = masks.to(device)
-            preds = model(images, heatmaps)
-            dice_scores.append(dice_coefficient(preds, masks).mean().item())
-            iou_scores.append(iou_score(preds, masks).mean().item())
+            masks1 = masks1.to(device)
+            masks2 = masks2.to(device)
+            preds1, preds2 = model(images, heatmaps)
+            dice_scores.append(((dice_coefficient(preds1, masks1) + dice_coefficient(preds2, masks2)) / 2).mean().item())
+            iou_scores.append(((iou_score(preds1, masks1) + iou_score(preds2, masks2)) / 2).mean().item())
 
             if save_root and epoch is not None:
                 save_validation_batch(
                     images=images,
                     heatmaps=heatmaps,
-                    masks=masks,
-                    preds=preds,
+                    masks1=masks1,
+                    masks2=masks2,
+                    preds1=preds1,
+                    preds2=preds2,
                     save_root=save_root,
                     epoch=epoch,
                     batch_idx=batch_idx,
@@ -155,7 +180,12 @@ def train(
         progress = tqdm(train_loader, desc=f"Epoch {epoch}/{epochs}")
 
         def log_to_visdom(
-            batch_images: torch.Tensor, batch_heatmaps: torch.Tensor, batch_masks: torch.Tensor, batch_preds: torch.Tensor
+            batch_images: torch.Tensor,
+            batch_heatmaps: torch.Tensor,
+            batch_masks1: torch.Tensor,
+            batch_masks2: torch.Tensor,
+            batch_preds1: torch.Tensor,
+            batch_preds2: torch.Tensor,
         ) -> None:
             """Visualize the current batch on Visdom."""
 
@@ -172,21 +202,26 @@ def train(
 
             img = _prep_single(batch_images[0])
             heatmap = _prep_single(batch_heatmaps[0])
-            gt = _prep_single(batch_masks[0])
-            pred = _prep_single(batch_preds[0])
+            gt1 = _prep_single(batch_masks1[0])
+            gt2 = _prep_single(batch_masks2[0])
+            pred1 = _prep_single(batch_preds1[0])
+            pred2 = _prep_single(batch_preds2[0])
 
             viz.image(img, win="input_image", opts={"title": f"Input Epoch {epoch}"})
             viz.image(heatmap, win="heatmap", opts={"title": f"Heatmap Epoch {epoch}"})
-            viz.image(gt, win="ground_truth", opts={"title": f"Ground Truth Epoch {epoch}"})
-            viz.image(pred, win="prediction", opts={"title": f"Prediction Epoch {epoch}"})
+            viz.image(gt1, win="ground_truth_1", opts={"title": f"GT1 Epoch {epoch}"})
+            viz.image(gt2, win="ground_truth_2", opts={"title": f"GT2 Epoch {epoch}"})
+            viz.image(pred1, win="prediction_1", opts={"title": f"Pred1 Epoch {epoch}"})
+            viz.image(pred2, win="prediction_2", opts={"title": f"Pred2 Epoch {epoch}"})
 
-        for images, heatmaps, masks in progress:
+        for images, heatmaps, masks1, masks2 in progress:
             images = images.to(device)
             heatmaps = heatmaps.to(device)
-            masks = masks.to(device)
+            masks1 = masks1.to(device)
+            masks2 = masks2.to(device)
 
-            preds = model(images, heatmaps)
-            loss = dice_bce_loss(preds, masks)
+            preds1, preds2 = model(images, heatmaps)
+            loss = 0.5 * (dice_bce_loss(preds1, masks1) + dice_bce_loss(preds2, masks2))
 
             optimizer.zero_grad()
             loss.backward()
@@ -195,7 +230,7 @@ def train(
             epoch_loss += loss.item()
             progress.set_postfix(loss=loss.item())
 
-            log_to_visdom(images, heatmaps, masks, preds)
+            log_to_visdom(images, heatmaps, masks1, masks2, preds1, preds2)
 
         scheduler.step()
         avg_loss = epoch_loss / len(train_loader)
@@ -221,8 +256,8 @@ def train(
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Interactive PRP area segmentation trainer")
-    parser.add_argument("--train_dir", type=str, default="dataset/train", help="Path to training dataset")
-    parser.add_argument("--val_dir", type=str, default="dataset/val", help="Path to validation dataset")
+    parser.add_argument("--train_dir", type=str, default="/dataset_liekong/train", help="Path to training dataset")
+    parser.add_argument("--val_dir", type=str, default="/dataset_liekong/val", help="Path to validation dataset")
     parser.add_argument("--epochs", type=int, default=300)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=5e-4)

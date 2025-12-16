@@ -11,13 +11,17 @@ from albumentations.core.transforms_interface import BasicTransform
 
 
 class PRPDataset(torch.utils.data.Dataset):
-    """
-    Dataset for Interactive Retinal Laser Photocoagulation area segmentation.
+    """Dataset for semi-automatic PRP segmentation with dual targets.
 
-    Each case directory can contain multiple target sub-region masks (gt_*.png).
-    Every target mask is treated as an individual sample while sharing the case
-    image, and a dynamic click heatmap is generated from an eroded version of
-    that mask to avoid overfitting to fixed coordinates.
+    Each case folder must contain:
+        - image.png
+        - gt_1.png
+        - gt_2.png
+
+    A simulated click heatmap is generated from gt_1 and all images/masks are
+    resized to ``target_size`` (default: 1280x1280). Spatial augmentations are
+    applied consistently across the image, both masks, and the heatmap to keep
+    alignment intact.
     """
 
     def __init__(
@@ -37,20 +41,20 @@ class PRPDataset(torch.utils.data.Dataset):
         if not self.cases:
             raise ValueError(f"No case folders found in {root_dir}")
 
-        self.samples: List[Tuple[str, str]] = []
+        self.samples: List[str] = []
         for case_dir in self.cases:
-            mask_paths = sorted(glob(os.path.join(case_dir, "gt_*.png")))
-            if not mask_paths:
-                raise ValueError(f"No gt_*.png masks found in {case_dir}")
-            for mask_path in mask_paths:
-                self.samples.append((case_dir, mask_path))
+            for required in ["image.png", "gt_1.png", "gt_2.png"]:
+                if not os.path.exists(os.path.join(case_dir, required)):
+                    raise FileNotFoundError(f"Missing {required} in {case_dir}")
+            self.samples.append(case_dir)
 
-        self.transform = self._build_transform()
+        self.spatial_transform = self._build_spatial_transform()
+        self.color_transform = self._build_color_transform() if augment else None
 
     def __len__(self) -> int:  # pragma: no cover - trivial
         return len(self.samples)
 
-    def _build_transform(self) -> A.Compose:
+    def _build_spatial_transform(self) -> A.Compose:
         transforms: list[BasicTransform] = []
         if self.augment:
             transforms.extend(
@@ -65,8 +69,6 @@ class PRPDataset(torch.utils.data.Dataset):
                         mask_value=0,
                     ),
                     A.HorizontalFlip(p=0.5),
-                    A.HueSaturationValue(hue_shift_limit=5, sat_shift_limit=8, val_shift_limit=8, p=0.5),
-                    A.RandomBrightnessContrast(brightness_limit=0.1, contrast_limit=0.1, p=0.5),
                 ]
             )
 
@@ -78,7 +80,21 @@ class PRPDataset(torch.utils.data.Dataset):
             )
         )
 
-        return A.Compose(transforms, additional_targets={"mask": "mask"})
+        return A.Compose(
+            transforms,
+            additional_targets={
+                "mask1": "mask",
+                "mask2": "mask",
+            },
+        )
+
+    def _build_color_transform(self) -> A.Compose:
+        return A.Compose(
+            [
+                A.HueSaturationValue(hue_shift_limit=5, sat_shift_limit=8, val_shift_limit=8, p=0.5),
+                A.RandomBrightnessContrast(brightness_limit=0.1, contrast_limit=0.1, p=0.5),
+            ]
+        )
 
     def _load_image(self, case_dir: str) -> np.ndarray:
         image_path = os.path.join(case_dir, "image.png")
@@ -116,47 +132,77 @@ class PRPDataset(torch.utils.data.Dataset):
         return heatmap.astype(np.float32)
 
     def _sample_click(self, mask: np.ndarray) -> Tuple[int, int]:
-        kernel = np.ones((5, 5), np.uint8)
-        eroded = cv2.erode(mask, kernel, iterations=1)
-        ys, xs = np.where(eroded > 0)
+        """Sample a click biased by distance to the mask centroid.
+
+        80% probability to sample inside the mask and 20% outside (within 320
+        pixels). The selection probability is inversely proportional to the
+        distance to the centroid of ``mask``.
+        """
+
+        ys, xs = np.where(mask > 0)
+        h, w = mask.shape
         if len(ys) == 0:
-            ys, xs = np.where(mask > 0)
-        if len(ys) == 0:
-            h, w = mask.shape
             return h // 2, w // 2
 
-        # Increase the selection probability for pixels closer to the mask centroid
         centroid_y = float(ys.mean())
         centroid_x = float(xs.mean())
-        distances = np.sqrt((ys - centroid_y) ** 2 + (xs - centroid_x) ** 2)
-        # Avoid division by zero; closer pixels get higher weights
-        weights = 1.0 / (distances + 1e-3)
+
+        inside = np.random.rand() < 0.8
+
+        if inside:
+            distances = np.sqrt((ys - centroid_y) ** 2 + (xs - centroid_x) ** 2)
+            weights = 1.0 / (distances + 1e-3)
+            probs = weights / weights.sum()
+            idx = np.random.choice(len(ys), p=probs)
+            return int(ys[idx]), int(xs[idx])
+
+        # Outside sampling within 320 px radius
+        grid_y, grid_x = np.meshgrid(np.arange(h), np.arange(w), indexing="ij")
+        distances = np.sqrt((grid_y - centroid_y) ** 2 + (grid_x - centroid_x) ** 2)
+        outside_mask = (mask == 0) & (distances <= 320)
+        candidate_ys, candidate_xs = np.where(outside_mask)
+        if len(candidate_ys) == 0:
+            return h // 2, w // 2
+
+        outside_distances = distances[outside_mask]
+        weights = 1.0 / (outside_distances + 1e-3)
         probs = weights / weights.sum()
-        idx = np.random.choice(len(ys), p=probs)
-        return int(ys[idx]), int(xs[idx])
+        idx = np.random.choice(len(candidate_ys), p=probs)
+        return int(candidate_ys[idx]), int(candidate_xs[idx])
 
     def __getitem__(self, idx: int):
-        case_dir, mask_path = self.samples[idx]
+        case_dir = self.samples[idx]
         image = self._load_image(case_dir)
-        mask = self._load_mask(mask_path)
+        mask1 = self._load_mask(os.path.join(case_dir, "gt_1.png"))
+        mask2 = self._load_mask(os.path.join(case_dir, "gt_2.png"))
 
-        augmented = self.transform(image=image, mask=mask)
+        augmented = self.spatial_transform(image=image, mask1=mask1, mask2=mask2)
         image = augmented["image"]
-        mask = augmented["mask"]
+        mask1 = augmented["mask1"]
+        mask2 = augmented["mask2"]
 
-        h, w = mask.shape
-        click_y, click_x = self._sample_click(mask)
+        if self.color_transform:
+            image = self.color_transform(image=image)["image"]
+
+        h, w = mask1.shape
+        click_y, click_x = self._sample_click(mask1)
         heatmap = self._generate_heatmap(h, w, (click_y, click_x))
 
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         image = image.astype(np.float32) / 255.0
 
-        tensor_transform = A.Compose([ToTensorV2()], additional_targets={"heatmap": "mask"})
-        tensors = tensor_transform(image=image, mask=mask, heatmap=heatmap)
+        tensor_transform = A.Compose(
+            [ToTensorV2()],
+            additional_targets={
+                "mask1": "mask",
+                "mask2": "mask",
+                "heatmap": "mask",
+            },
+        )
+        tensors = tensor_transform(image=image, mask1=mask1, mask2=mask2, heatmap=heatmap)
         image_tensor = tensors["image"]
-        mask_tensor = tensors["mask"].unsqueeze(0).float()
-        #heatmap_tensor = tensors["heatmap"].unsqueeze(0)
-        #heatmap_tensor = torch.from_numpy(tensors["heatmap"]).float().unsqueeze(0)
+        mask1_tensor = tensors["mask1"].unsqueeze(0).float()
+        mask2_tensor = tensors["mask2"].unsqueeze(0).float()
         heatmap_tensor = tensors["heatmap"].float().unsqueeze(0)
 
-        return image_tensor, heatmap_tensor, mask_tensor
+        return image_tensor, heatmap_tensor, mask1_tensor, mask2_tensor
