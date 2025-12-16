@@ -150,11 +150,14 @@ class PRPSegmenter(nn.Module):
         self.attention = CrossAttentionFusion(channels=512)
         self.vit_refiner = ViTFeatureRefiner(channels=512, num_layers=2, num_heads=8)
 
-        self.decoder = UNetDecoder(
+        self.decoder1 = UNetDecoder(
+            encoder_channels=[64, 64, 128, 256, 512]
+        )
+        self.decoder2 = UNetDecoder(
             encoder_channels=[64, 64, 128, 256, 512]
         )
 
-    def forward(self, image: torch.Tensor, heatmap: torch.Tensor) -> torch.Tensor:
+    def forward(self, image: torch.Tensor, heatmap: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         x1 = self.relu(self.bn1(self.conv1(image)))  # (B, 64, H/2, W/2)
         x2 = self.layer1(self.maxpool(x1))           # (B, 64, H/4, W/4)
         x3 = self.layer2(x2)                         # (B, 128, H/8, W/8)
@@ -167,6 +170,8 @@ class PRPSegmenter(nn.Module):
         fused = self.attention(prompt_feat, x5)
         fused = self.vit_refiner(fused)
 
-        logits = self.decoder([x1, x2, x3, x4, fused])
-        logits = F.interpolate(logits, size=image.shape[2:], mode="bilinear", align_corners=False)
-        return torch.sigmoid(logits)
+        logits1 = self.decoder1([x1, x2, x3, x4, fused])
+        logits2 = self.decoder2([x1, x2, x3, x4, fused])
+        logits1 = F.interpolate(logits1, size=image.shape[2:], mode="bilinear", align_corners=False)
+        logits2 = F.interpolate(logits2, size=image.shape[2:], mode="bilinear", align_corners=False)
+        return torch.sigmoid(logits1), torch.sigmoid(logits2)
