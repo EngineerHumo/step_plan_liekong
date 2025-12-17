@@ -3,6 +3,12 @@ import os
 from pathlib import Path
 from typing import List, Tuple
 
+# 1. 调整 import 顺序，确保在 import pyplot 之前配置好 backend（可选，但推荐）
+import matplotlib
+# 如果你的环境装了 PyQt5，可以用 'Qt5Agg'，否则用 'TkAgg' (Python自带)
+# 如果不确定，可以把下面这行注释掉，让 matplotlib 自动选择
+# matplotlib.use('TkAgg')
+
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -13,8 +19,10 @@ from scipy import ndimage as ndi
 from model import PRPSegmenter
 
 
-plt.switch_backend("Agg") if os.environ.get("DISPLAY", "") == "" else None
-
+# ================= 修改处 1：删除导致报错的代码 =================
+# 原代码：plt.switch_backend("Agg") if os.environ.get("DISPLAY", "") == "" else None
+# 原因：Windows下没有 DISPLAY 环境变量，这行代码强制关闭了显示窗口，导致 ginput 无法工作。
+# ==============================================================
 
 def load_model(model_path: str, device: torch.device) -> PRPSegmenter:
     model = PRPSegmenter(pretrained=False)
@@ -98,17 +106,18 @@ def draw_circles_on_mask(gt2_mask: np.ndarray, centers: List[Tuple[int, int]], d
 
 
 def infer_with_click(
-    model: PRPSegmenter,
-    image: Image.Image,
-    click_xy: Tuple[float, float],
-    sigma: float,
-    device: torch.device,
-    gt1_threshold: float,
-    gt2_threshold: float,
-    circle_diameter: int,
-    circle_spacing: int,
+        model: PRPSegmenter,
+        image: Image.Image,
+        click_xy: Tuple[float, float],
+        sigma: float,
+        device: torch.device,
+        gt1_threshold: float,
+        gt2_threshold: float,
+        circle_diameter: int,
+        circle_spacing: int,
 ) -> Tuple[np.ndarray, np.ndarray, Image.Image]:
     input_image = image.resize((1280, 1280), Image.BILINEAR)
+    # 注意：这里的 1240 可能是原代码的一个硬编码尺寸，确保和你的模型训练尺寸一致
     click_scaled = (click_xy[0] / 1240 * 1280, click_xy[1] / 1240 * 1280)
     heatmap_np = generate_gaussian_heatmap(1280, 1280, click_scaled, sigma)
 
@@ -134,14 +143,31 @@ def infer_with_click(
 
 
 def display_intermediate(image: Image.Image) -> Tuple[float, float]:
-    plt.figure("Input Image", figsize=(6, 6))
+    # ================= 修改处 2：优化显示逻辑 =================
+    print("正在打开图像窗口，请在病灶位置点击鼠标左键...")
+
+    # 启用交互模式，确保窗口不会阻塞导致假死（虽然 ginput 本身是阻塞的）
+    plt.ion()
+    fig = plt.figure("Input Image", figsize=(8, 8))
     plt.imshow(image)
     plt.axis("off")
-    plt.title("单击选择提示位置")
-    coords = plt.ginput(1, timeout=0)
-    plt.close()
+    plt.title("单击选择提示位置 (Click to select prompt)")
+
+    # 强制绘制一下，防止窗口空白
+    plt.draw()
+    plt.pause(0.1)
+
+    # 获取点击输入，timeout=0 表示无限等待直到点击
+    coords = plt.ginput(1, timeout=0, mouse_add=1, mouse_stop=None, mouse_pop=None)
+
+    plt.close(fig)
+    plt.ioff()  # 关闭交互模式
+    # =======================================================
+
     if not coords:
-        raise RuntimeError("未检测到点击，请重新运行并点击图像。")
+        raise RuntimeError("未检测到点击，或者窗口被直接关闭。请重新运行并点击图像。")
+
+    print(f"捕获点击坐标: {coords[0]}")
     return coords[0]
 
 
@@ -176,8 +202,10 @@ def save_outputs(gt1: np.ndarray, gt2: np.ndarray, overlay: Image.Image, output_
 
 def main():
     parser = argparse.ArgumentParser(description="交互式点击预测并生成后处理分割结果")
-    parser.add_argument("--model-path", required=True, help="模型权重路径")
-    parser.add_argument("--image-path", required=True, help="待预测图像路径")
+    # 请确保这里的路径是你本地实际存在的路径
+    parser.add_argument("--model-path", default=r"C:\work space\liekoong\predict\best_model.pth", help="模型权重路径")
+    parser.add_argument("--image-path", default=r"C:\work space\liekoong\demo\20250529110843581.bmp",
+                        help="待预测图像路径")
     parser.add_argument("--output-dir", default="outputs", help="输出保存目录")
     parser.add_argument("--device", default=None, help="使用的设备，如 cuda:0 或 cpu")
     parser.add_argument("--gt1-threshold", type=float, default=0.5, help="gt_1 阈值")
@@ -188,10 +216,21 @@ def main():
     args = parser.parse_args()
 
     device = torch.device(args.device) if args.device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # 简单的文件存在性检查
+    if not os.path.exists(args.model_path):
+        print(f"Error: 模型文件不存在: {args.model_path}")
+        return
+    if not os.path.exists(args.image_path):
+        print(f"Error: 图像文件不存在: {args.image_path}")
+        return
+
     model = load_model(args.model_path, device)
 
     image = Image.open(args.image_path).convert("RGB")
     display_image = image.resize((1240, 1240), Image.BILINEAR)
+
+    # 这一步会弹出窗口等待点击
     click_xy = display_intermediate(display_image)
 
     gt1, gt2, overlay = infer_with_click(
