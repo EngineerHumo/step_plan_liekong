@@ -282,8 +282,17 @@ def main():
     parser = argparse.ArgumentParser(description="交互式点击预测并生成后处理分割结果")
     # 请确保这里的路径是你本地实际存在的路径
     parser.add_argument("--model-path", default=r"C:\work space\liekoong\predict\best_model.pth", help="模型权重路径")
-    parser.add_argument("--image-path", default=r"C:\work space\liekoong\demo\20250529110843581.bmp",
-                        help="待预测图像路径")
+
+
+
+    #parser.add_argument("--image-path", default=r"C:\work space\liekoong\demo\20250529110843581.bmp", help="待预测图像路径")
+    parser.add_argument("--image-path", default=r"C:\work space\liekoong\demo\20250716135814005.bmp", help="待预测图像路径")
+    #parser.add_argument("--image-path", default=r"C:\work space\liekoong\demo\20250716093224878.bmp", help="待预测图像路径")
+    #parser.add_argument("--image-path", default=r"C:\work space\liekoong\demo\20250828104039988.bmp", help="待预测图像路径")
+    #parser.add_argument("--image-path", default=r"C:\work space\liekoong\demo\20250710151243623.bmp", help="待预测图像路径")
+    #parser.add_argument("--image-path", default=r"C:\work space\liekoong\demo\20250620160048170.bmp", help="待预测图像路径")
+
+
     parser.add_argument("--output-dir", default="outputs", help="输出保存目录")
     parser.add_argument("--device", default=None, help="使用的设备，如 cuda:0 或 cpu")
     parser.add_argument("--gt1-threshold", type=float, default=0.5, help="gt_1 阈值")
