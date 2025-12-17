@@ -11,16 +11,15 @@ from albumentations.core.transforms_interface import BasicTransform
 
 
 class PRPDataset(torch.utils.data.Dataset):
-    """Dataset for semi-automatic PRP segmentation with dual targets.
+    """Dataset for semi-automatic PRP segmentation with a single target.
 
     Each case folder must contain:
         - image.png
         - gt_1.png
-        - gt_2.png
 
     A simulated click heatmap is generated from gt_1 and all images/masks are
     resized to ``target_size`` (default: 1280x1280). Spatial augmentations are
-    applied consistently across the image, both masks, and the heatmap to keep
+    applied consistently across the image, the mask, and the heatmap to keep
     alignment intact.
     """
 
@@ -43,7 +42,7 @@ class PRPDataset(torch.utils.data.Dataset):
 
         self.samples: List[str] = []
         for case_dir in self.cases:
-            for required in ["image.png", "gt_1.png", "gt_2.png"]:
+            for required in ["image.png", "gt_1.png"]:
                 if not os.path.exists(os.path.join(case_dir, required)):
                     raise FileNotFoundError(f"Missing {required} in {case_dir}")
             self.samples.append(case_dir)
@@ -84,7 +83,6 @@ class PRPDataset(torch.utils.data.Dataset):
             transforms,
             additional_targets={
                 "mask1": "mask",
-                "mask2": "mask",
             },
         )
 
@@ -174,12 +172,10 @@ class PRPDataset(torch.utils.data.Dataset):
         case_dir = self.samples[idx]
         image = self._load_image(case_dir)
         mask1 = self._load_mask(os.path.join(case_dir, "gt_1.png"))
-        mask2 = self._load_mask(os.path.join(case_dir, "gt_2.png"))
 
-        augmented = self.spatial_transform(image=image, mask1=mask1, mask2=mask2)
+        augmented = self.spatial_transform(image=image, mask1=mask1)
         image = augmented["image"]
         mask1 = augmented["mask1"]
-        mask2 = augmented["mask2"]
 
         if self.color_transform:
             image = self.color_transform(image=image)["image"]
@@ -195,14 +191,12 @@ class PRPDataset(torch.utils.data.Dataset):
             [ToTensorV2()],
             additional_targets={
                 "mask1": "mask",
-                "mask2": "mask",
                 "heatmap": "mask",
             },
         )
-        tensors = tensor_transform(image=image, mask1=mask1, mask2=mask2, heatmap=heatmap)
+        tensors = tensor_transform(image=image, mask1=mask1, heatmap=heatmap)
         image_tensor = tensors["image"]
         mask1_tensor = tensors["mask1"].unsqueeze(0).float()
-        mask2_tensor = tensors["mask2"].unsqueeze(0).float()
         heatmap_tensor = tensors["heatmap"].float().unsqueeze(0)
 
-        return image_tensor, heatmap_tensor, mask1_tensor, mask2_tensor
+        return image_tensor, heatmap_tensor, mask1_tensor

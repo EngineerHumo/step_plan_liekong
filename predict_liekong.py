@@ -197,16 +197,13 @@ def infer_with_click(
     heatmap_tensor = torch.from_numpy(heatmap_np).unsqueeze(0).unsqueeze(0).to(device)
 
     with torch.no_grad():
-        pred1, pred2 = model(image_tensor, heatmap_tensor)
+        pred1 = model(image_tensor, heatmap_tensor)
 
     pred1_resized = F.interpolate(pred1, size=(1240, 1240), mode="bilinear", align_corners=False)
-    pred2_resized = F.interpolate(pred2, size=(1240, 1240), mode="bilinear", align_corners=False)
-
     gt1 = (pred1_resized.squeeze().cpu().numpy() >= gt1_threshold)
-    gt2 = (pred2_resized.squeeze().cpu().numpy() >= gt2_threshold)
 
     gt1_processed = binary_dilation_keep_nearest(gt1, click_point=click_xy, radius=12)
-    gt2_processed = remove_overlap(gt2, gt1_processed)
+    gt2_processed = np.zeros_like(gt1_processed, dtype=bool)
 
     centers = plan_circle_layout(
         gt1_mask=gt1_processed,
