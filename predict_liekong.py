@@ -1,0 +1,217 @@
+import argparse
+import os
+from pathlib import Path
+from typing import List, Tuple
+
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+import torch.nn.functional as F
+from PIL import Image, ImageDraw
+from scipy import ndimage as ndi
+
+from model import PRPSegmenter
+
+
+plt.switch_backend("Agg") if os.environ.get("DISPLAY", "") == "" else None
+
+
+def load_model(model_path: str, device: torch.device) -> PRPSegmenter:
+    model = PRPSegmenter(pretrained=False)
+    checkpoint = torch.load(model_path, map_location=device)
+    if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+        checkpoint = checkpoint["state_dict"]
+    model.load_state_dict(checkpoint)
+    model.to(device)
+    model.eval()
+    return model
+
+
+def pil_to_tensor(image: Image.Image) -> torch.Tensor:
+    array = np.array(image).astype(np.float32) / 255.0
+    tensor = torch.from_numpy(array).permute(2, 0, 1)
+    return tensor
+
+
+def generate_gaussian_heatmap(height: int, width: int, center: Tuple[float, float], sigma: float) -> np.ndarray:
+    y = np.arange(0, height, 1, float)
+    x = np.arange(0, width, 1, float)
+    yy, xx = np.meshgrid(y, x, indexing="ij")
+    heatmap = np.exp(-((yy - center[1]) ** 2 + (xx - center[0]) ** 2) / (2 * sigma ** 2))
+    heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
+    return heatmap.astype(np.float32)
+
+
+def binary_dilation_keep_largest(mask: np.ndarray, radius: int = 5) -> np.ndarray:
+    if mask.sum() == 0:
+        return mask
+    grid = np.arange(-radius, radius + 1)
+    gx, gy = np.meshgrid(grid, grid, indexing="xy")
+    kernel = (gx ** 2 + gy ** 2) <= radius ** 2
+    dilated = ndi.binary_dilation(mask, structure=kernel)
+    labeled, num = ndi.label(dilated)
+    if num == 0:
+        return np.zeros_like(mask, dtype=bool)
+    sizes = ndi.sum(np.ones_like(mask, dtype=np.int32), labels=labeled, index=range(1, num + 1))
+    largest_idx = int(np.argmax(sizes)) + 1
+    return labeled == largest_idx
+
+
+def remove_overlap(mask: np.ndarray, reference: np.ndarray) -> np.ndarray:
+    return mask & (~reference)
+
+
+def greedy_circle_centers(band_mask: np.ndarray, min_spacing: int, radius: int) -> List[Tuple[int, int]]:
+    ys, xs = np.where(band_mask)
+    centers: List[Tuple[int, int]] = []
+    for y, x in zip(ys, xs):
+        if all((x - cx) ** 2 + (y - cy) ** 2 >= min_spacing ** 2 for cy, cx in centers):
+            centers.append((y, x))
+    return centers
+
+
+def plan_circle_layout(gt2_mask: np.ndarray, radius: int, spacing: int) -> List[Tuple[int, int]]:
+    if gt2_mask.sum() == 0:
+        return []
+    dist = ndi.distance_transform_edt(gt2_mask)
+    centers: List[Tuple[int, int]] = []
+    for ring_idx in range(3):
+        target = radius + ring_idx * spacing
+        band = (dist >= target - spacing / 2) & (dist <= target + spacing / 2)
+        band &= dist >= radius
+        if band.sum() == 0:
+            continue
+        new_centers = greedy_circle_centers(band, spacing, radius)
+        centers.extend(new_centers)
+    return centers
+
+
+def draw_circles_on_mask(gt2_mask: np.ndarray, centers: List[Tuple[int, int]], diameter: int) -> Image.Image:
+    base = (gt2_mask.astype(np.uint8) * 255)
+    canvas = Image.fromarray(base).convert("RGB")
+    draw = ImageDraw.Draw(canvas)
+    radius = diameter // 2
+    for y, x in centers:
+        bbox = [x - radius, y - radius, x + radius, y + radius]
+        draw.ellipse(bbox, outline="blue", width=2)
+    return canvas
+
+
+def infer_with_click(
+    model: PRPSegmenter,
+    image: Image.Image,
+    click_xy: Tuple[float, float],
+    sigma: float,
+    device: torch.device,
+    gt1_threshold: float,
+    gt2_threshold: float,
+    circle_diameter: int,
+    circle_spacing: int,
+) -> Tuple[np.ndarray, np.ndarray, Image.Image]:
+    input_image = image.resize((1280, 1280), Image.BILINEAR)
+    click_scaled = (click_xy[0] / 1240 * 1280, click_xy[1] / 1240 * 1280)
+    heatmap_np = generate_gaussian_heatmap(1280, 1280, click_scaled, sigma)
+
+    image_tensor = pil_to_tensor(input_image).unsqueeze(0).to(device)
+    heatmap_tensor = torch.from_numpy(heatmap_np).unsqueeze(0).unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        pred1, pred2 = model(image_tensor, heatmap_tensor)
+
+    pred1_resized = F.interpolate(pred1, size=(1240, 1240), mode="bilinear", align_corners=False)
+    pred2_resized = F.interpolate(pred2, size=(1240, 1240), mode="bilinear", align_corners=False)
+
+    gt1 = (pred1_resized.squeeze().cpu().numpy() >= gt1_threshold)
+    gt2 = (pred2_resized.squeeze().cpu().numpy() >= gt2_threshold)
+
+    gt1_processed = binary_dilation_keep_largest(gt1, radius=5)
+    gt2_processed = remove_overlap(gt2, gt1_processed)
+
+    centers = plan_circle_layout(gt2_processed, radius=circle_diameter // 2, spacing=circle_spacing)
+    overlay = draw_circles_on_mask(gt2_processed, centers, diameter=circle_diameter)
+
+    return gt1_processed.astype(np.uint8), gt2_processed.astype(np.uint8), overlay
+
+
+def display_intermediate(image: Image.Image) -> Tuple[float, float]:
+    plt.figure("Input Image", figsize=(6, 6))
+    plt.imshow(image)
+    plt.axis("off")
+    plt.title("单击选择提示位置")
+    coords = plt.ginput(1, timeout=0)
+    plt.close()
+    if not coords:
+        raise RuntimeError("未检测到点击，请重新运行并点击图像。")
+    return coords[0]
+
+
+def visualize_results(gt1: np.ndarray, gt2: np.ndarray, overlay: Image.Image):
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    axes[0].imshow(gt1, cmap="gray")
+    axes[0].set_title("gt_1 后处理")
+    axes[1].imshow(gt2, cmap="gray")
+    axes[1].set_title("gt_2 去重叠")
+    axes[2].imshow(overlay)
+    axes[2].set_title("gt_2 蓝色圆形标注")
+    for ax in axes:
+        ax.axis("off")
+    plt.tight_layout()
+    plt.show()
+
+
+def save_outputs(gt1: np.ndarray, gt2: np.ndarray, overlay: Image.Image, output_dir: Path, stem: str):
+    output_dir.mkdir(parents=True, exist_ok=True)
+    gt1_img = Image.fromarray(gt1 * 255)
+    gt2_img = Image.fromarray(gt2 * 255)
+    gt1_path = output_dir / f"{stem}_gt_1.png"
+    gt2_path = output_dir / f"{stem}_gt_2.png"
+    overlay_path = output_dir / f"{stem}_gt_2_overlay.png"
+    gt1_img.save(gt1_path)
+    gt2_img.save(gt2_path)
+    overlay.save(overlay_path)
+    print(f"保存 gt_1 至 {gt1_path}")
+    print(f"保存 gt_2 至 {gt2_path}")
+    print(f"保存带圆形标注的 gt_2 至 {overlay_path}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="交互式点击预测并生成后处理分割结果")
+    parser.add_argument("--model-path", required=True, help="模型权重路径")
+    parser.add_argument("--image-path", required=True, help="待预测图像路径")
+    parser.add_argument("--output-dir", default="outputs", help="输出保存目录")
+    parser.add_argument("--device", default=None, help="使用的设备，如 cuda:0 或 cpu")
+    parser.add_argument("--gt1-threshold", type=float, default=0.5, help="gt_1 阈值")
+    parser.add_argument("--gt2-threshold", type=float, default=0.4, help="gt_2 阈值")
+    parser.add_argument("--sigma", type=float, default=15.0, help="点击生成高斯热图的标准差")
+    parser.add_argument("--circle-diameter", type=int, default=15, help="绘制蓝色圆的直径")
+    parser.add_argument("--circle-spacing", type=int, default=10, help="蓝色圆之间的最小间距")
+    args = parser.parse_args()
+
+    device = torch.device(args.device) if args.device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = load_model(args.model_path, device)
+
+    image = Image.open(args.image_path).convert("RGB")
+    display_image = image.resize((1240, 1240), Image.BILINEAR)
+    click_xy = display_intermediate(display_image)
+
+    gt1, gt2, overlay = infer_with_click(
+        model=model,
+        image=image,
+        click_xy=click_xy,
+        sigma=args.sigma,
+        device=device,
+        gt1_threshold=args.gt1_threshold,
+        gt2_threshold=args.gt2_threshold,
+        circle_diameter=args.circle_diameter,
+        circle_spacing=args.circle_spacing,
+    )
+
+    visualize_results(gt1, gt2, overlay)
+
+    output_dir = Path(args.output_dir)
+    stem = Path(args.image_path).stem
+    save_outputs(gt1, gt2, overlay, output_dir, stem)
+
+
+if __name__ == "__main__":
+    main()
