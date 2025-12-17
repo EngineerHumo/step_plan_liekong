@@ -50,7 +50,9 @@ def generate_gaussian_heatmap(height: int, width: int, center: Tuple[float, floa
     return heatmap.astype(np.float32)
 
 
-def binary_dilation_keep_largest(mask: np.ndarray, radius: int = 5) -> np.ndarray:
+def binary_dilation_keep_nearest(
+    mask: np.ndarray, click_point: Tuple[float, float], radius: int = 5
+) -> np.ndarray:
     if mask.sum() == 0:
         return mask
     grid = np.arange(-radius, radius + 1)
@@ -60,9 +62,25 @@ def binary_dilation_keep_largest(mask: np.ndarray, radius: int = 5) -> np.ndarra
     labeled, num = ndi.label(dilated)
     if num == 0:
         return np.zeros_like(mask, dtype=bool)
-    sizes = ndi.sum(np.ones_like(mask, dtype=np.int32), labels=labeled, index=range(1, num + 1))
-    largest_idx = int(np.argmax(sizes)) + 1
-    return labeled == largest_idx
+
+    click_x, click_y = click_point
+    best_label = None
+    best_distance_sq = None
+
+    for label_idx in range(1, num + 1):
+        ys, xs = np.where(labeled == label_idx)
+        if len(xs) == 0:
+            continue
+        distances_sq = (xs - click_x) ** 2 + (ys - click_y) ** 2
+        min_distance_sq = float(distances_sq.min())
+        if best_distance_sq is None or min_distance_sq < best_distance_sq:
+            best_distance_sq = min_distance_sq
+            best_label = label_idx
+
+    if best_label is None:
+        return np.zeros_like(mask, dtype=bool)
+
+    return labeled == best_label
 
 
 def remove_overlap(mask: np.ndarray, reference: np.ndarray) -> np.ndarray:
@@ -187,7 +205,7 @@ def infer_with_click(
     gt1 = (pred1_resized.squeeze().cpu().numpy() >= gt1_threshold)
     gt2 = (pred2_resized.squeeze().cpu().numpy() >= gt2_threshold)
 
-    gt1_processed = binary_dilation_keep_largest(gt1, radius=12)
+    gt1_processed = binary_dilation_keep_nearest(gt1, click_point=click_xy, radius=12)
     gt2_processed = remove_overlap(gt2, gt1_processed)
 
     centers = plan_circle_layout(
