@@ -69,12 +69,22 @@ def remove_overlap(mask: np.ndarray, reference: np.ndarray) -> np.ndarray:
     return mask & (~reference)
 
 
-def greedy_circle_centers(band_mask: np.ndarray, min_center_dist: int) -> List[Tuple[int, int]]:
+def greedy_circle_centers(
+    band_mask: np.ndarray,
+    min_center_dist: int,
+    rng: np.random.Generator,
+    existing: List[Tuple[int, int]] | None = None,
+) -> List[Tuple[int, int]]:
     ys, xs = np.where(band_mask)
+    # 为了避免按扫描顺序导致的局部堆积，随机打乱候选点顺序
+    order = rng.permutation(len(xs))
     centers: List[Tuple[int, int]] = []
-    for y, x in zip(ys, xs):
+    existing = existing or []
+    for idx in order:
+        y, x = ys[idx], xs[idx]
         if all((x - cx) ** 2 + (y - cy) ** 2 >= min_center_dist ** 2 for cy, cx in centers):
-            centers.append((y, x))
+            if all((x - cx) ** 2 + (y - cy) ** 2 >= min_center_dist ** 2 for cy, cx in existing):
+                centers.append((y, x))
     return centers
 
 
@@ -97,29 +107,50 @@ def plan_circle_layout(
     if gt2_mask.sum() == 0 or gt1_mask.sum() == 0:
         return []
 
+    # 仅考虑 gt_2 内与 gt_1 相邻的边界区域
     adjacency = gt2_mask & ndi.binary_dilation(gt1_mask, structure=np.ones((3, 3)))
     if adjacency.sum() == 0:
         return []
 
-    dist = ndi.distance_transform_edt(~adjacency)
-    dist = dist * gt2_mask  # 仅在 gt_2 区域内有效
-
-    effective_spacing = spacing + 2 * radius
+    # 计算到接触边界的距离（仅在 gt_2 内有效），并限制最大距离确保只有三圈
+    dist = ndi.distance_transform_edt(~adjacency) * gt2_mask
+    effective_spacing = spacing + 2 * radius  # 圆心间距，保证圆边界间距为 spacing
+    max_distance = radius + 2 * effective_spacing + spacing  # 超过三圈的距离范围全部舍弃
 
     centers: List[Tuple[int, int]] = []
+    rng = np.random.default_rng(42)
+    band_half_width = max(1, effective_spacing // 3)
+
     for ring_idx in range(3):
-        target = radius + ring_idx * effective_spacing
-        band = (dist >= target - effective_spacing / 2) & (dist <= target + effective_spacing / 2) & gt2_mask
-        if band.sum() == 0:
-            continue
-        new_centers = greedy_circle_centers(band, effective_spacing)
-        centers.extend(new_centers)
+        target_base = radius + ring_idx * effective_spacing
+        candidate_shifts = [-spacing // 2, 0, spacing // 2]
+        best_ring_centers: List[Tuple[int, int]] = []
+
+        for shift in candidate_shifts:
+            target = max(radius, target_base + shift)
+            band = (
+                (dist >= target - band_half_width)
+                & (dist <= target + band_half_width)
+                & (dist <= max_distance)
+                & gt2_mask
+            )
+            if band.sum() == 0:
+                continue
+            new_centers = greedy_circle_centers(
+                band_mask=band,
+                min_center_dist=effective_spacing,
+                rng=rng,
+                existing=centers,
+            )
+            if len(new_centers) > len(best_ring_centers):
+                best_ring_centers = new_centers
+
+        centers.extend(best_ring_centers)
     return centers
 
 
-def draw_circles_on_mask(gt2_mask: np.ndarray, centers: List[Tuple[int, int]], diameter: int) -> Image.Image:
-    base = (gt2_mask.astype(np.uint8) * 255)
-    canvas = Image.fromarray(base).convert("RGB")
+def draw_circles_on_image(base_image: Image.Image, centers: List[Tuple[int, int]], diameter: int) -> Image.Image:
+    canvas = base_image.copy()
     draw = ImageDraw.Draw(canvas)
     radius = diameter // 2
     for y, x in centers:
@@ -156,7 +187,7 @@ def infer_with_click(
     gt1 = (pred1_resized.squeeze().cpu().numpy() >= gt1_threshold)
     gt2 = (pred2_resized.squeeze().cpu().numpy() >= gt2_threshold)
 
-    gt1_processed = binary_dilation_keep_largest(gt1, radius=5)
+    gt1_processed = binary_dilation_keep_largest(gt1, radius=12)
     gt2_processed = remove_overlap(gt2, gt1_processed)
 
     centers = plan_circle_layout(
@@ -165,7 +196,8 @@ def infer_with_click(
         radius=circle_diameter // 2,
         spacing=circle_spacing,
     )
-    overlay = draw_circles_on_mask(gt2_processed, centers, diameter=circle_diameter)
+    resized_image = image.resize((1240, 1240), Image.BILINEAR)
+    overlay = draw_circles_on_image(resized_image, centers, diameter=circle_diameter)
 
     return gt1_processed.astype(np.uint8), gt2_processed.astype(np.uint8), overlay
 
@@ -240,7 +272,12 @@ def main():
     parser.add_argument("--gt2-threshold", type=float, default=0.4, help="gt_2 阈值")
     parser.add_argument("--sigma", type=float, default=15.0, help="点击生成高斯热图的标准差")
     parser.add_argument("--circle-diameter", type=int, default=15, help="绘制蓝色圆的直径")
-    parser.add_argument("--circle-spacing", type=int, default=10, help="蓝色圆之间的最小间距")
+    parser.add_argument(
+        "--circle-spacing",
+        type=int,
+        default=10,
+        help="蓝色圆之间的最小边界间距（像素）",
+    )
     args = parser.parse_args()
 
     device = torch.device(args.device) if args.device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
