@@ -36,9 +36,7 @@ def save_validation_batch(
     images: torch.Tensor,
     heatmaps: torch.Tensor,
     masks1: torch.Tensor,
-    masks2: torch.Tensor,
     preds1: torch.Tensor,
-    preds2: torch.Tensor,
     save_root: str,
     epoch: int,
     batch_idx: int,
@@ -54,9 +52,7 @@ def save_validation_batch(
         image_np = tensor_to_image(images[i])
         heatmap_np = heatmaps[i, 0].detach().cpu().numpy()
         mask1_np = masks1[i, 0].detach().cpu().numpy()
-        mask2_np = masks2[i, 0].detach().cpu().numpy()
         pred1_np = preds1[i, 0].detach().cpu().numpy()
-        pred2_np = preds2[i, 0].detach().cpu().numpy()
 
         click_y, click_x = divmod(heatmap_np.argmax(), heatmap_np.shape[1])
         scale_y = original_size[0] / heatmap_np.shape[0]
@@ -67,26 +63,20 @@ def save_validation_batch(
         image_resized = cv2.resize(image_np, (original_size[1], original_size[0]))
         heatmap_resized = cv2.resize(heatmap_np, (original_size[1], original_size[0]))
         mask1_resized = cv2.resize(mask1_np, (original_size[1], original_size[0]), interpolation=cv2.INTER_NEAREST)
-        mask2_resized = cv2.resize(mask2_np, (original_size[1], original_size[0]), interpolation=cv2.INTER_NEAREST)
         pred1_resized = cv2.resize(pred1_np, (original_size[1], original_size[0]))
-        pred2_resized = cv2.resize(pred2_np, (original_size[1], original_size[0]))
 
         image_with_click = image_resized.copy()
         cv2.circle(image_with_click, (int(click_x_resized), int(click_y_resized)), 8, (255, 0, 0), thickness=-1)
 
         pred1_mask = (pred1_resized > 0.5).astype(np.uint8) * 255
-        pred2_mask = (pred2_resized > 0.5).astype(np.uint8) * 255
         gt1_mask = (mask1_resized > 0.5).astype(np.uint8) * 255
-        gt2_mask = (mask2_resized > 0.5).astype(np.uint8) * 255
 
         basename = f"sample_{batch_idx:03d}_{i:02d}"
         cv2.imwrite(os.path.join(epoch_dir, f"{basename}_image.png"), cv2.cvtColor(image_resized, cv2.COLOR_RGB2BGR))
         cv2.imwrite(os.path.join(epoch_dir, f"{basename}_click.png"), cv2.cvtColor(image_with_click, cv2.COLOR_RGB2BGR))
         cv2.imwrite(os.path.join(epoch_dir, f"{basename}_heatmap.png"), (heatmap_resized * 255).astype(np.uint8))
         cv2.imwrite(os.path.join(epoch_dir, f"{basename}_pred1.png"), pred1_mask)
-        cv2.imwrite(os.path.join(epoch_dir, f"{basename}_pred2.png"), pred2_mask)
         cv2.imwrite(os.path.join(epoch_dir, f"{basename}_gt1.png"), gt1_mask)
-        cv2.imwrite(os.path.join(epoch_dir, f"{basename}_gt2.png"), gt2_mask)
 
 
 def dice_bce_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -107,23 +97,20 @@ def evaluate(
     dice_scores = []
     iou_scores = []
     with torch.no_grad():
-        for batch_idx, (images, heatmaps, masks1, masks2) in enumerate(loader):
+        for batch_idx, (images, heatmaps, masks1) in enumerate(loader):
             images = images.to(device)
             heatmaps = heatmaps.to(device)
             masks1 = masks1.to(device)
-            masks2 = masks2.to(device)
-            preds1, preds2 = model(images, heatmaps)
-            dice_scores.append(((dice_coefficient(preds1, masks1) + dice_coefficient(preds2, masks2)) / 2).mean().item())
-            iou_scores.append(((iou_score(preds1, masks1) + iou_score(preds2, masks2)) / 2).mean().item())
+            preds1 = model(images, heatmaps)
+            dice_scores.append(dice_coefficient(preds1, masks1).mean().item())
+            iou_scores.append(iou_score(preds1, masks1).mean().item())
 
             if save_root and epoch is not None:
                 save_validation_batch(
                     images=images,
                     heatmaps=heatmaps,
                     masks1=masks1,
-                    masks2=masks2,
                     preds1=preds1,
-                    preds2=preds2,
                     save_root=save_root,
                     epoch=epoch,
                     batch_idx=batch_idx,
@@ -173,6 +160,7 @@ def train(
 
     ensure_dir(output_dir)
     best_val_dice = float("-inf")
+    best_epoch: Optional[int] = None
 
     for epoch in range(1, epochs + 1):
         epoch_loss = 0.0
@@ -182,9 +170,7 @@ def train(
             batch_images: torch.Tensor,
             batch_heatmaps: torch.Tensor,
             batch_masks1: torch.Tensor,
-            batch_masks2: torch.Tensor,
             batch_preds1: torch.Tensor,
-            batch_preds2: torch.Tensor,
         ) -> None:
             """Visualize the current batch on Visdom."""
 
@@ -202,25 +188,20 @@ def train(
             img = _prep_single(batch_images[0])
             heatmap = _prep_single(batch_heatmaps[0])
             gt1 = _prep_single(batch_masks1[0])
-            gt2 = _prep_single(batch_masks2[0])
             pred1 = _prep_single(batch_preds1[0])
-            pred2 = _prep_single(batch_preds2[0])
 
             viz.image(img, win="input_image", opts={"title": f"Input Epoch {epoch}"})
             viz.image(heatmap, win="heatmap", opts={"title": f"Heatmap Epoch {epoch}"})
             viz.image(gt1, win="ground_truth_1", opts={"title": f"GT1 Epoch {epoch}"})
-            viz.image(gt2, win="ground_truth_2", opts={"title": f"GT2 Epoch {epoch}"})
             viz.image(pred1, win="prediction_1", opts={"title": f"Pred1 Epoch {epoch}"})
-            viz.image(pred2, win="prediction_2", opts={"title": f"Pred2 Epoch {epoch}"})
 
-        for images, heatmaps, masks1, masks2 in progress:
+        for images, heatmaps, masks1 in progress:
             images = images.to(device)
             heatmaps = heatmaps.to(device)
             masks1 = masks1.to(device)
-            masks2 = masks2.to(device)
 
-            preds1, preds2 = model(images, heatmaps)
-            loss = 0.5 * (dice_bce_loss(preds1, masks1) + dice_bce_loss(preds2, masks2))
+            preds1 = model(images, heatmaps)
+            loss = dice_bce_loss(preds1, masks1)
 
             optimizer.zero_grad()
             loss.backward()
@@ -229,7 +210,7 @@ def train(
             epoch_loss += loss.item()
             progress.set_postfix(loss=loss.item())
 
-            log_to_visdom(images, heatmaps, masks1, masks2, preds1, preds2)
+            log_to_visdom(images, heatmaps, masks1, preds1)
 
         scheduler.step()
         avg_loss = epoch_loss / len(train_loader)
@@ -244,13 +225,14 @@ def train(
 
         if val_loader:
             val_save_dir = os.path.join(output_dir, "val_outputs")
-            
+
             # 使用 eval_model (单卡) 进行验证
             val_dice, val_iou = evaluate(eval_model, val_loader, device, save_root=val_save_dir, epoch=epoch)
             print(f"Epoch {epoch}: Val Dice={val_dice:.4f} | Val IoU={val_iou:.4f}")
 
             if val_dice > best_val_dice:
                 best_val_dice = val_dice
+                best_epoch = epoch
                 # 保存模型时直接用 eval_model (已经是解包过的状态)
                 torch.save(eval_model.state_dict(), os.path.join(output_dir, "best_model.pth"))
                 print(f"New best model saved with Val Dice {val_dice:.4f}")
@@ -262,6 +244,11 @@ def train(
     # 最后保存也使用解包后的模型
     final_model_to_save = model.module if isinstance(model, nn.DataParallel) else model
     torch.save(final_model_to_save.state_dict(), os.path.join(output_dir, "final_model.pth"))
+
+    if best_epoch is not None:
+        print(f"Best validation model was achieved at epoch {best_epoch} with Dice {best_val_dice:.4f}")
+    else:
+        print("Validation was not run; no best epoch to report.")
 
 
 def parse_args():
