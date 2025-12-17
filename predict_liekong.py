@@ -73,15 +73,18 @@ def greedy_circle_centers(
     band_mask: np.ndarray,
     min_center_dist: int,
     rng: np.random.Generator,
+    existing: List[Tuple[int, int]] | None = None,
 ) -> List[Tuple[int, int]]:
     ys, xs = np.where(band_mask)
     # 为了避免按扫描顺序导致的局部堆积，随机打乱候选点顺序
     order = rng.permutation(len(xs))
     centers: List[Tuple[int, int]] = []
+    existing = existing or []
     for idx in order:
         y, x = ys[idx], xs[idx]
         if all((x - cx) ** 2 + (y - cy) ** 2 >= min_center_dist ** 2 for cy, cx in centers):
-            centers.append((y, x))
+            if all((x - cx) ** 2 + (y - cy) ** 2 >= min_center_dist ** 2 for cy, cx in existing):
+                centers.append((y, x))
     return centers
 
 
@@ -119,17 +122,30 @@ def plan_circle_layout(
     band_half_width = max(1, effective_spacing // 3)
 
     for ring_idx in range(3):
-        target = radius + ring_idx * effective_spacing
-        band = (
-            (dist >= target - band_half_width)
-            & (dist <= target + band_half_width)
-            & (dist <= max_distance)
-            & gt2_mask
-        )
-        if band.sum() == 0:
-            continue
-        new_centers = greedy_circle_centers(band, effective_spacing, rng)
-        centers.extend(new_centers)
+        target_base = radius + ring_idx * effective_spacing
+        candidate_shifts = [-spacing // 2, 0, spacing // 2]
+        best_ring_centers: List[Tuple[int, int]] = []
+
+        for shift in candidate_shifts:
+            target = max(radius, target_base + shift)
+            band = (
+                (dist >= target - band_half_width)
+                & (dist <= target + band_half_width)
+                & (dist <= max_distance)
+                & gt2_mask
+            )
+            if band.sum() == 0:
+                continue
+            new_centers = greedy_circle_centers(
+                band_mask=band,
+                min_center_dist=effective_spacing,
+                rng=rng,
+                existing=centers,
+            )
+            if len(new_centers) > len(best_ring_centers):
+                best_ring_centers = new_centers
+
+        centers.extend(best_ring_centers)
     return centers
 
 
