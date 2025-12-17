@@ -69,11 +69,11 @@ def remove_overlap(mask: np.ndarray, reference: np.ndarray) -> np.ndarray:
     return mask & (~reference)
 
 
-def greedy_circle_centers(band_mask: np.ndarray, min_spacing: int, radius: int) -> List[Tuple[int, int]]:
+def greedy_circle_centers(band_mask: np.ndarray, min_center_dist: int) -> List[Tuple[int, int]]:
     ys, xs = np.where(band_mask)
     centers: List[Tuple[int, int]] = []
     for y, x in zip(ys, xs):
-        if all((x - cx) ** 2 + (y - cy) ** 2 >= min_spacing ** 2 for cy, cx in centers):
+        if all((x - cx) ** 2 + (y - cy) ** 2 >= min_center_dist ** 2 for cy, cx in centers):
             centers.append((y, x))
     return centers
 
@@ -90,7 +90,8 @@ def plan_circle_layout(
     逻辑：
     1. 找到 gt_2 与 gt_1 相邻的边界像素（在 gt_2 内，且 8 邻域接触 gt_1）。
     2. 以该边界作为参考，计算 gt_2 内到边界的距离，并按距离分三圈取样。
-    3. 仅在 gt_2 内放置圆形，不在 gt_1 内放置。
+    3. 蓝色圆之间的最小间距基于圆边缘，因此圆心间距 = 直径 + 最小间距。
+    4. 仅在 gt_2 内放置圆形，不在 gt_1 内放置。
     """
 
     if gt2_mask.sum() == 0 or gt1_mask.sum() == 0:
@@ -103,13 +104,15 @@ def plan_circle_layout(
     dist = ndi.distance_transform_edt(~adjacency)
     dist = dist * gt2_mask  # 仅在 gt_2 区域内有效
 
+    effective_spacing = spacing + 2 * radius
+
     centers: List[Tuple[int, int]] = []
     for ring_idx in range(3):
-        target = radius + ring_idx * spacing
-        band = (dist >= target - spacing / 2) & (dist <= target + spacing / 2) & gt2_mask
+        target = radius + ring_idx * effective_spacing
+        band = (dist >= target - effective_spacing / 2) & (dist <= target + effective_spacing / 2) & gt2_mask
         if band.sum() == 0:
             continue
-        new_centers = greedy_circle_centers(band, spacing, radius)
+        new_centers = greedy_circle_centers(band, effective_spacing)
         centers.extend(new_centers)
     return centers
 
