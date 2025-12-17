@@ -16,7 +16,6 @@ from utils import dice_coefficient, iou_score
 
 def default_device() -> str:
     """Prefer CUDA when available, defaulting to GPU 0 for multi-GPU training."""
-
     if torch.cuda.is_available():
         return "cuda:0"
     return "cpu"
@@ -236,32 +235,43 @@ def train(
         avg_loss = epoch_loss / len(train_loader)
         print(f"Epoch {epoch}: Train Loss={avg_loss:.4f}")
 
+        # ==============================================================================
+        # 核心修改：统一提取单卡模型用于验证和评估
+        # 这确保了无论是在验证集还是在训练集上跑 evaluate，都不会因为 Batch 切分问题
+        # 导致其中一张卡分到空数据而崩溃。
+        # ==============================================================================
+        eval_model = model.module if isinstance(model, nn.DataParallel) else model
+
         if val_loader:
             val_save_dir = os.path.join(output_dir, "val_outputs")
-            val_dice, val_iou = evaluate(model, val_loader, device, save_root=val_save_dir, epoch=epoch)
+            
+            # 使用 eval_model (单卡) 进行验证
+            val_dice, val_iou = evaluate(eval_model, val_loader, device, save_root=val_save_dir, epoch=epoch)
             print(f"Epoch {epoch}: Val Dice={val_dice:.4f} | Val IoU={val_iou:.4f}")
 
             if val_dice > best_val_dice:
                 best_val_dice = val_dice
-                model_to_save = model.module if isinstance(model, nn.DataParallel) else model
-                torch.save(model_to_save.state_dict(), os.path.join(output_dir, "best_model.pth"))
+                # 保存模型时直接用 eval_model (已经是解包过的状态)
+                torch.save(eval_model.state_dict(), os.path.join(output_dir, "best_model.pth"))
                 print(f"New best model saved with Val Dice {val_dice:.4f}")
 
-        train_dice, train_iou = evaluate(model, train_loader, device)
+        # 使用 eval_model (单卡) 计算训练集指标，修复之前的崩溃点
+        train_dice, train_iou = evaluate(eval_model, train_loader, device)
         print(f"Epoch {epoch}: Train Dice={train_dice:.4f} | Train IoU={train_iou:.4f}")
 
-    model_to_save = model.module if isinstance(model, nn.DataParallel) else model
-    torch.save(model_to_save.state_dict(), os.path.join(output_dir, "final_model.pth"))
+    # 最后保存也使用解包后的模型
+    final_model_to_save = model.module if isinstance(model, nn.DataParallel) else model
+    torch.save(final_model_to_save.state_dict(), os.path.join(output_dir, "final_model.pth"))
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Interactive PRP area segmentation trainer")
-    parser.add_argument("--train_dir", type=str, default="/dataset_liekong/train", help="Path to training dataset")
-    parser.add_argument("--val_dir", type=str, default="/dataset_liekong/val", help="Path to validation dataset")
-    parser.add_argument("--epochs", type=int, default=300)
-    parser.add_argument("--batch_size", type=int, default=16)
-    parser.add_argument("--lr", type=float, default=5e-4)
-    parser.add_argument("--num_workers", type=int, default=16)
+    parser.add_argument("--train_dir", type=str, default="dataset_liekong/train", help="Path to training dataset")
+    parser.add_argument("--val_dir", type=str, default="dataset_liekong/val", help="Path to validation dataset")
+    parser.add_argument("--epochs", type=int, default=400)
+    parser.add_argument("--batch_size", type=int, default=12)
+    parser.add_argument("--lr", type=float, default=6e-4)
+    parser.add_argument("--num_workers", type=int, default=12)
     parser.add_argument("--device", type=str, default=default_device())
     parser.add_argument("--use_visdom", action="store_true", help="Enable Visdom visualization")
     parser.add_argument("--visdom_env", type=str, default="prp_segmentation", help="Visdom environment name")
