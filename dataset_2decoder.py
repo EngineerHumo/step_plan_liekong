@@ -41,12 +41,17 @@ class PRPDataset(torch.utils.data.Dataset):
         if not self.cases:
             raise ValueError(f"No case folders found in {root_dir}")
 
-        self.samples: List[str] = []
+        self.samples: List[dict] = []
         for case_dir in self.cases:
             for required in ["image.png", "gt_1.png", "gt_2.png"]:
                 if not os.path.exists(os.path.join(case_dir, required)):
                     raise FileNotFoundError(f"Missing {required} in {case_dir}")
-            self.samples.append(case_dir)
+
+            mask1 = self._load_mask(os.path.join(case_dir, "gt_1.png"))
+            component_count = self._count_connected_components(mask1)
+            repeats = 3 if component_count > 1 else 1
+            for _ in range(repeats):
+                self.samples.append({"case_dir": case_dir, "component_count": component_count})
 
         self.spatial_transform = self._build_spatial_transform()
         self.color_transform = self._build_color_transform() if augment else None
@@ -96,6 +101,22 @@ class PRPDataset(torch.utils.data.Dataset):
             ]
         )
 
+    @staticmethod
+    def _count_connected_components(mask: np.ndarray) -> int:
+        num_labels, _ = cv2.connectedComponents(mask, connectivity=8)
+        return max(num_labels - 1, 0)
+
+    @staticmethod
+    def _select_single_component(mask: np.ndarray) -> np.ndarray:
+        num_labels, labels = cv2.connectedComponents(mask, connectivity=8)
+        if num_labels <= 2:
+            # A single foreground component or empty mask.
+            return mask
+
+        component_labels = np.arange(1, num_labels)
+        chosen = np.random.choice(component_labels)
+        return (labels == chosen).astype(np.uint8)
+
     def _load_image(self, case_dir: str) -> np.ndarray:
         image_path = os.path.join(case_dir, "image.png")
         if os.path.exists(image_path):
@@ -131,12 +152,12 @@ class PRPDataset(torch.utils.data.Dataset):
         heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
         return heatmap.astype(np.float32)
 
-    def _sample_click(self, mask: np.ndarray) -> Tuple[int, int]:
+    def _sample_click(self, mask: np.ndarray, inside: bool) -> Tuple[int, int]:
         """Sample a click biased by distance to the mask centroid.
 
-        80% probability to sample inside the mask and 20% outside (within 320
-        pixels). The selection probability is inversely proportional to the
-        distance to the centroid of ``mask``.
+        When ``inside`` is True, sample from foreground pixels. Otherwise sample
+        from background pixels. The selection probability is inversely
+        proportional to the distance from the centroid of the foreground mask.
         """
 
         ys, xs = np.where(mask > 0)
@@ -147,34 +168,46 @@ class PRPDataset(torch.utils.data.Dataset):
         centroid_y = float(ys.mean())
         centroid_x = float(xs.mean())
 
-        inside = np.random.rand() < 0.8
-
         if inside:
-            distances = np.sqrt((ys - centroid_y) ** 2 + (xs - centroid_x) ** 2)
-            weights = 1.0 / (distances + 1e-3)
-            probs = weights / weights.sum()
-            idx = np.random.choice(len(ys), p=probs)
-            return int(ys[idx]), int(xs[idx])
+            candidate_ys, candidate_xs = ys, xs
+        else:
+            candidate_ys, candidate_xs = np.where(mask == 0)
 
-        # Outside sampling within 320 px radius
-        grid_y, grid_x = np.meshgrid(np.arange(h), np.arange(w), indexing="ij")
-        distances = np.sqrt((grid_y - centroid_y) ** 2 + (grid_x - centroid_x) ** 2)
-        outside_mask = (mask == 0) & (distances <= 320)
-        candidate_ys, candidate_xs = np.where(outside_mask)
         if len(candidate_ys) == 0:
             return h // 2, w // 2
 
-        outside_distances = distances[outside_mask]
-        weights = 1.0 / (outside_distances + 1e-3)
+        distances = np.sqrt((candidate_ys - centroid_y) ** 2 + (candidate_xs - centroid_x) ** 2)
+        weights = 1.0 / (distances + 1e-3)
         probs = weights / weights.sum()
         idx = np.random.choice(len(candidate_ys), p=probs)
         return int(candidate_ys[idx]), int(candidate_xs[idx])
 
     def __getitem__(self, idx: int):
-        case_dir = self.samples[idx]
+        sample_info = self.samples[idx]
+        case_dir = sample_info["case_dir"]
+        component_count = sample_info["component_count"]
+
         image = self._load_image(case_dir)
         mask1 = self._load_mask(os.path.join(case_dir, "gt_1.png"))
         mask2 = self._load_mask(os.path.join(case_dir, "gt_2.png"))
+
+        click_exists = True
+        click_inside_mask = True
+
+        if component_count > 1:
+            if np.random.rand() < 0.5:
+                mask1 = self._select_single_component(mask1)
+                click_inside_mask = True
+            else:
+                click_exists = False
+        else:
+            rand_val = np.random.rand()
+            if rand_val < 0.7:
+                click_inside_mask = True
+            elif rand_val < 0.85:
+                click_inside_mask = False
+            else:
+                click_exists = False
 
         augmented = self.spatial_transform(image=image, mask1=mask1, mask2=mask2)
         image = augmented["image"]
@@ -185,8 +218,11 @@ class PRPDataset(torch.utils.data.Dataset):
             image = self.color_transform(image=image)["image"]
 
         h, w = mask1.shape
-        click_y, click_x = self._sample_click(mask1)
-        heatmap = self._generate_heatmap(h, w, (click_y, click_x))
+        if click_exists:
+            click_y, click_x = self._sample_click(mask1, inside=click_inside_mask)
+            heatmap = self._generate_heatmap(h, w, (click_y, click_x))
+        else:
+            heatmap = np.zeros((h, w), dtype=np.float32)
 
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         image = image.astype(np.float32) / 255.0
