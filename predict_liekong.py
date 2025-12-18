@@ -1,7 +1,7 @@
 import argparse
 import os
 from pathlib import Path
-from typing import List, Tuple
+from typing import Callable, List, Tuple
 
 # 1. 调整 import 顺序，确保在 import pyplot 之前配置好 backend（可选，但推荐）
 import matplotlib
@@ -50,41 +50,10 @@ def generate_gaussian_heatmap(height: int, width: int, center: Tuple[float, floa
     return heatmap.astype(np.float32)
 
 
-def binary_dilation_keep_nearest(
-    mask: np.ndarray, click_point: Tuple[float, float], radius: int = 5
-) -> np.ndarray:
-    if mask.sum() == 0:
-        return mask
+def make_disk(radius: int) -> np.ndarray:
     grid = np.arange(-radius, radius + 1)
     gx, gy = np.meshgrid(grid, grid, indexing="xy")
-    kernel = (gx ** 2 + gy ** 2) <= radius ** 2
-    dilated = ndi.binary_dilation(mask, structure=kernel)
-    labeled, num = ndi.label(dilated)
-    if num == 0:
-        return np.zeros_like(mask, dtype=bool)
-
-    click_x, click_y = click_point
-    best_label = None
-    best_distance_sq = None
-
-    for label_idx in range(1, num + 1):
-        ys, xs = np.where(labeled == label_idx)
-        if len(xs) == 0:
-            continue
-        distances_sq = (xs - click_x) ** 2 + (ys - click_y) ** 2
-        min_distance_sq = float(distances_sq.min())
-        if best_distance_sq is None or min_distance_sq < best_distance_sq:
-            best_distance_sq = min_distance_sq
-            best_label = label_idx
-
-    if best_label is None:
-        return np.zeros_like(mask, dtype=bool)
-
-    return labeled == best_label
-
-
-def remove_overlap(mask: np.ndarray, reference: np.ndarray) -> np.ndarray:
-    return mask & (~reference)
+    return (gx ** 2 + gy ** 2) <= radius ** 2
 
 
 def greedy_circle_centers(
@@ -108,62 +77,38 @@ def greedy_circle_centers(
 
 def plan_circle_layout(
     gt1_mask: np.ndarray,
-    gt2_mask: np.ndarray,
     radius: int,
     spacing: int,
 ) -> List[Tuple[int, int]]:
     """
-    沿着 gt_2 中与 gt_1 相邻的边界，在 gt_2 内布置三圈蓝色圆形。
-
-    逻辑：
-    1. 找到 gt_2 与 gt_1 相邻的边界像素（在 gt_2 内，且 8 邻域接触 gt_1）。
-    2. 以该边界作为参考，计算 gt_2 内到边界的距离，并按距离分三圈取样。
-    3. 蓝色圆之间的最小间距基于圆边缘，因此圆心间距 = 直径 + 最小间距。
-    4. 仅在 gt_2 内放置圆形，不在 gt_1 内放置。
+    围绕 gt_1 连通区域布置三圈蓝色圆形，保证圆之间的边界间距不小于 spacing。
     """
 
-    if gt2_mask.sum() == 0 or gt1_mask.sum() == 0:
+    if gt1_mask.sum() == 0:
         return []
 
-    # 仅考虑 gt_2 内与 gt_1 相邻的边界区域
-    adjacency = gt2_mask & ndi.binary_dilation(gt1_mask, structure=np.ones((3, 3)))
-    if adjacency.sum() == 0:
-        return []
-
-    # 计算到接触边界的距离（仅在 gt_2 内有效），并限制最大距离确保只有三圈
-    dist = ndi.distance_transform_edt(~adjacency) * gt2_mask
-    effective_spacing = spacing + 2 * radius  # 圆心间距，保证圆边界间距为 spacing
-    max_distance = radius + 2 * effective_spacing + spacing  # 超过三圈的距离范围全部舍弃
-
+    effective_spacing = spacing + 2 * radius  # 圆心间距，保证边界间距为 spacing
+    dist = ndi.distance_transform_edt(~gt1_mask)
     centers: List[Tuple[int, int]] = []
     rng = np.random.default_rng(42)
     band_half_width = max(1, effective_spacing // 3)
 
     for ring_idx in range(3):
-        target_base = radius + ring_idx * effective_spacing
-        candidate_shifts = [-spacing // 2, 0, spacing // 2]
-        best_ring_centers: List[Tuple[int, int]] = []
-
-        for shift in candidate_shifts:
-            target = max(radius, target_base + shift)
-            band = (
-                (dist >= target - band_half_width)
-                & (dist <= target + band_half_width)
-                & (dist <= max_distance)
-                & gt2_mask
-            )
-            if band.sum() == 0:
-                continue
-            new_centers = greedy_circle_centers(
-                band_mask=band,
-                min_center_dist=effective_spacing,
-                rng=rng,
-                existing=centers,
-            )
-            if len(new_centers) > len(best_ring_centers):
-                best_ring_centers = new_centers
-
-        centers.extend(best_ring_centers)
+        target = radius + spacing + ring_idx * effective_spacing
+        band = (
+            (dist >= target - band_half_width)
+            & (dist <= target + band_half_width)
+            & (~gt1_mask)
+        )
+        if band.sum() == 0:
+            continue
+        new_centers = greedy_circle_centers(
+            band_mask=band,
+            min_center_dist=effective_spacing,
+            rng=rng,
+            existing=centers,
+        )
+        centers.extend(new_centers)
     return centers
 
 
@@ -177,17 +122,92 @@ def draw_circles_on_image(base_image: Image.Image, centers: List[Tuple[int, int]
     return canvas
 
 
+def filter_components_by_confidence(
+    mask: np.ndarray, logits: np.ndarray, confidence_threshold: float
+) -> np.ndarray:
+    labeled, num = ndi.label(mask)
+    if num == 0:
+        return mask
+    keep = np.zeros(num + 1, dtype=bool)
+    high_conf = logits > confidence_threshold
+    for idx in range(1, num + 1):
+        if np.any(high_conf & (labeled == idx)):
+            keep[idx] = True
+    return keep[labeled]
+
+
+def connect_close_components(mask: np.ndarray, max_distance: float = 100.0) -> np.ndarray:
+    def draw_line(a: Tuple[int, int], b: Tuple[int, int]) -> List[Tuple[int, int]]:
+        y0, x0 = a
+        y1, x1 = b
+        points = []
+        dy = abs(y1 - y0)
+        dx = abs(x1 - x0)
+        sy = 1 if y0 < y1 else -1
+        sx = 1 if x0 < x1 else -1
+        err = dx - dy
+        while True:
+            points.append((y0, x0))
+            if y0 == y1 and x0 == x1:
+                break
+            e2 = 2 * err
+            if e2 > -dy:
+                err -= dy
+                x0 += sx
+            if e2 < dx:
+                err += dx
+                y0 += sy
+        return points
+
+    updated = mask.copy()
+    while True:
+        labeled, num = ndi.label(updated)
+        if num <= 1:
+            break
+        merged = False
+        components = [np.argwhere(labeled == i) for i in range(1, num + 1)]
+        for i in range(num):
+            coords_i = components[i]
+            if coords_i.size == 0:
+                continue
+            for j in range(i + 1, num):
+                coords_j = components[j]
+                if coords_j.size == 0:
+                    continue
+                dist_map, indices = ndi.distance_transform_edt(
+                    ~(labeled == (j + 1)), return_indices=True
+                )
+                distances = dist_map[coords_i[:, 0], coords_i[:, 1]]
+                min_idx = int(np.argmin(distances))
+                min_dist = float(distances[min_idx])
+                if min_dist < max_distance:
+                    nearest_target = (
+                        int(indices[0, coords_i[min_idx, 0], coords_i[min_idx, 1]]),
+                        int(indices[1, coords_i[min_idx, 0], coords_i[min_idx, 1]]),
+                    )
+                    start_point = (int(coords_i[min_idx, 0]), int(coords_i[min_idx, 1]))
+                    for y, x in draw_line(start_point, nearest_target):
+                        updated[y, x] = True
+                    merged = True
+                    break
+            if merged:
+                break
+        if not merged:
+            break
+    return updated
+
+
 def infer_with_click(
-        model: PRPSegmenter,
-        image: Image.Image,
-        click_xy: Tuple[float, float],
-        sigma: float,
-        device: torch.device,
-        gt1_threshold: float,
-        gt2_threshold: float,
-        circle_diameter: int,
-        circle_spacing: int,
-) -> Tuple[np.ndarray, np.ndarray, Image.Image]:
+    model: PRPSegmenter,
+    image: Image.Image,
+    click_xy: Tuple[float, float],
+    sigma: float,
+    device: torch.device,
+    gt1_threshold: float,
+    confidence_threshold: float,
+    circle_diameter: int,
+    circle_spacing: int,
+) -> Tuple[np.ndarray, Image.Image]:
     input_image = image.resize((1280, 1280), Image.BILINEAR)
     # 注意：这里的 1240 可能是原代码的一个硬编码尺寸，确保和你的模型训练尺寸一致
     click_scaled = (click_xy[0] / 1240 * 1280, click_xy[1] / 1240 * 1280)
@@ -197,27 +217,25 @@ def infer_with_click(
     heatmap_tensor = torch.from_numpy(heatmap_np).unsqueeze(0).unsqueeze(0).to(device)
 
     with torch.no_grad():
-        pred1, pred2 = model(image_tensor, heatmap_tensor)
+        pred1 = model(image_tensor, heatmap_tensor)
 
     pred1_resized = F.interpolate(pred1, size=(1240, 1240), mode="bilinear", align_corners=False)
-    pred2_resized = F.interpolate(pred2, size=(1240, 1240), mode="bilinear", align_corners=False)
+    logits = pred1_resized.squeeze().cpu().numpy()
 
-    gt1 = (pred1_resized.squeeze().cpu().numpy() >= gt1_threshold)
-    gt2 = (pred2_resized.squeeze().cpu().numpy() >= gt2_threshold)
-
-    gt1_processed = binary_dilation_keep_nearest(gt1, click_point=click_xy, radius=12)
-    gt2_processed = remove_overlap(gt2, gt1_processed)
+    gt1_initial = logits >= gt1_threshold
+    gt1_dilated = ndi.binary_dilation(gt1_initial, structure=make_disk(12))
+    gt1_filtered = filter_components_by_confidence(gt1_dilated, logits, confidence_threshold)
+    gt1_connected = connect_close_components(gt1_filtered, max_distance=100.0)
 
     centers = plan_circle_layout(
-        gt1_mask=gt1_processed,
-        gt2_mask=gt2_processed,
+        gt1_mask=gt1_connected,
         radius=circle_diameter // 2,
         spacing=circle_spacing,
     )
     resized_image = image.resize((1240, 1240), Image.BILINEAR)
     overlay = draw_circles_on_image(resized_image, centers, diameter=circle_diameter)
 
-    return gt1_processed.astype(np.uint8), gt2_processed.astype(np.uint8), overlay
+    return gt1_connected.astype(np.uint8), overlay
 
 
 def display_intermediate(image: Image.Image) -> Tuple[float, float]:
@@ -249,67 +267,66 @@ def display_intermediate(image: Image.Image) -> Tuple[float, float]:
     return coords[0]
 
 
-def visualize_results(gt1: np.ndarray, gt2: np.ndarray, overlay: Image.Image):
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-    axes[0].imshow(gt1, cmap="gray")
-    axes[0].set_title("gt_1 后处理")
-    axes[1].imshow(gt2, cmap="gray")
-    axes[1].set_title("gt_2 去重叠")
+def visualize_results(
+    original: Image.Image, gt1: np.ndarray, overlay: Image.Image, fig: plt.Figure | None
+) -> plt.Figure:
+    if fig is None or not plt.fignum_exists(fig.number):
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    else:
+        axes = fig.axes
+        if len(axes) != 3:
+            fig.clf()
+            axes = fig.subplots(1, 3, figsize=(15, 5))
+
+    axes[0].imshow(original)
+    axes[0].set_title("原图")
+    axes[1].imshow(gt1, cmap="gray")
+    axes[1].set_title("gt_1 后处理")
     axes[2].imshow(overlay)
-    axes[2].set_title("gt_2 蓝色圆形标注")
+    axes[2].set_title("gt_1 蓝色圆形标注")
     for ax in axes:
         ax.axis("off")
-    plt.tight_layout()
-    plt.show()
+    fig.tight_layout()
+    fig.canvas.draw_idle()
+    return fig
 
 
-def save_outputs(gt1: np.ndarray, gt2: np.ndarray, overlay: Image.Image, output_dir: Path, stem: str):
+def save_outputs(gt1: np.ndarray, overlay: Image.Image, output_dir: Path, stem: str):
     output_dir.mkdir(parents=True, exist_ok=True)
     gt1_img = Image.fromarray(gt1 * 255)
-    gt2_img = Image.fromarray(gt2 * 255)
     gt1_path = output_dir / f"{stem}_gt_1.png"
-    gt2_path = output_dir / f"{stem}_gt_2.png"
-    overlay_path = output_dir / f"{stem}_gt_2_overlay.png"
+    overlay_path = output_dir / f"{stem}_gt_1_overlay.png"
     gt1_img.save(gt1_path)
-    gt2_img.save(gt2_path)
     overlay.save(overlay_path)
     print(f"保存 gt_1 至 {gt1_path}")
-    print(f"保存 gt_2 至 {gt2_path}")
-    print(f"保存带圆形标注的 gt_2 至 {overlay_path}")
+    print(f"保存带圆形标注的 gt_1 至 {overlay_path}")
 
 
 def main():
     parser = argparse.ArgumentParser(description="交互式点击预测并生成后处理分割结果")
-    # 请确保这里的路径是你本地实际存在的路径
-    parser.add_argument("--model-path", default=r"C:\work space\liekoong\predict\best_model.pth", help="模型权重路径")
-
-
-
-    #parser.add_argument("--image-path", default=r"C:\work space\liekoong\demo\20250529110843581.bmp", help="待预测图像路径")
-    parser.add_argument("--image-path", default=r"C:\work space\liekoong\demo\20250716135814005.bmp", help="待预测图像路径")
-    #parser.add_argument("--image-path", default=r"C:\work space\liekoong\demo\20250716093224878.bmp", help="待预测图像路径")
-    #parser.add_argument("--image-path", default=r"C:\work space\liekoong\demo\20250828104039988.bmp", help="待预测图像路径")
-    #parser.add_argument("--image-path", default=r"C:\work space\liekoong\demo\20250710151243623.bmp", help="待预测图像路径")
-    #parser.add_argument("--image-path", default=r"C:\work space\liekoong\demo\20250620160048170.bmp", help="待预测图像路径")
-
-
+    parser.add_argument("--model-path", required=True, help="模型权重路径")
+    parser.add_argument("--image-path", required=True, help="待预测图像路径")
     parser.add_argument("--output-dir", default="outputs", help="输出保存目录")
     parser.add_argument("--device", default=None, help="使用的设备，如 cuda:0 或 cpu")
     parser.add_argument("--gt1-threshold", type=float, default=0.5, help="gt_1 阈值")
-    parser.add_argument("--gt2-threshold", type=float, default=0.4, help="gt_2 阈值")
+    parser.add_argument(
+        "--confidence-threshold",
+        type=float,
+        default=0.9,
+        help="保留连通区域所需的最小 logits 阈值",
+    )
     parser.add_argument("--sigma", type=float, default=15.0, help="点击生成高斯热图的标准差")
     parser.add_argument("--circle-diameter", type=int, default=15, help="绘制蓝色圆的直径")
     parser.add_argument(
         "--circle-spacing",
         type=int,
-        default=10,
+        default=5,
         help="蓝色圆之间的最小边界间距（像素）",
     )
     args = parser.parse_args()
 
     device = torch.device(args.device) if args.device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # 简单的文件存在性检查
     if not os.path.exists(args.model_path):
         print(f"Error: 模型文件不存在: {args.model_path}")
         return
@@ -318,30 +335,46 @@ def main():
         return
 
     model = load_model(args.model_path, device)
-
     image = Image.open(args.image_path).convert("RGB")
     display_image = image.resize((1240, 1240), Image.BILINEAR)
 
-    # 这一步会弹出窗口等待点击
-    click_xy = display_intermediate(display_image)
+    result_fig: plt.Figure | None = None
 
-    gt1, gt2, overlay = infer_with_click(
-        model=model,
-        image=image,
-        click_xy=click_xy,
-        sigma=args.sigma,
-        device=device,
-        gt1_threshold=args.gt1_threshold,
-        gt2_threshold=args.gt2_threshold,
-        circle_diameter=args.circle_diameter,
-        circle_spacing=args.circle_spacing,
+    def handle_click(event, *, on_infer: Callable):
+        nonlocal result_fig
+        if event.inaxes is None or event.button != 1:
+            return
+        click_xy = (event.xdata, event.ydata)
+        print(f"捕获点击坐标: {click_xy}")
+        gt1, overlay = on_infer(click_xy)
+        result_fig = visualize_results(display_image, gt1, overlay, result_fig)
+        stem = Path(args.image_path).stem
+        save_outputs(gt1, overlay, Path(args.output_dir), stem)
+
+    def run_inference(click_xy: Tuple[float, float]):
+        return infer_with_click(
+            model=model,
+            image=image,
+            click_xy=click_xy,
+            sigma=args.sigma,
+            device=device,
+            gt1_threshold=args.gt1_threshold,
+            confidence_threshold=args.confidence_threshold,
+            circle_diameter=args.circle_diameter,
+            circle_spacing=args.circle_spacing,
+        )
+
+    fig = plt.figure("Input Image", figsize=(8, 8))
+    ax = fig.add_subplot(111)
+    ax.imshow(display_image)
+    ax.axis("off")
+    ax.set_title("单击选择提示位置 (Click to select prompt)")
+    cid = fig.canvas.mpl_connect(
+        "button_press_event",
+        lambda event: handle_click(event, on_infer=run_inference),
     )
-
-    visualize_results(gt1, gt2, overlay)
-
-    output_dir = Path(args.output_dir)
-    stem = Path(args.image_path).stem
-    save_outputs(gt1, gt2, overlay, output_dir, stem)
+    print("图像窗口已打开，监听点击事件。单击以运行预测，窗口不会因一次点击而关闭。")
+    plt.show()
 
 
 if __name__ == "__main__":
