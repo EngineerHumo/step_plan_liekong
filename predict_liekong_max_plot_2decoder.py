@@ -3,10 +3,9 @@ import os
 from pathlib import Path
 from typing import List, Tuple
 
-# 1. 调整 import 顺序，确保在 import pyplot 之前配置好 backend（可选，但推荐）
+# 1. 设置 Matplotlib 后端，确保交互窗口正常工作
 import matplotlib
-# 如果你的环境装了 PyQt5，可以用 'Qt5Agg'，否则用 'TkAgg' (Python自带)
-# 如果不确定，可以把下面这行注释掉，让 matplotlib 自动选择
+# 建议在 Windows 下显式指定 TkAgg，避免某些环境下的报错
 # matplotlib.use('TkAgg')
 
 import matplotlib.pyplot as plt
@@ -19,10 +18,9 @@ from scipy import ndimage as ndi
 from model import PRPSegmenter
 
 
-# ================= 修改处 1：删除导致报错的代码 =================
-# 原代码：plt.switch_backend("Agg") if os.environ.get("DISPLAY", "") == "" else None
-# 原因：Windows下没有 DISPLAY 环境变量，这行代码强制关闭了显示窗口，导致 ginput 无法工作。
-# ==============================================================
+# ==========================================
+# 第一部分：核心算法与工具函数 (保留新代码的逻辑)
+# ==========================================
 
 def load_model(model_path: str, device: torch.device) -> PRPSegmenter:
     model = PRPSegmenter(pretrained=False)
@@ -50,9 +48,7 @@ def generate_gaussian_heatmap(height: int, width: int, center: Tuple[float, floa
     return heatmap.astype(np.float32)
 
 
-def binary_dilation_keep_nearest(
-    mask: np.ndarray, click_point: Tuple[float, float], radius: int = 5
-) -> np.ndarray:
+def binary_dilation_keep_largest(mask: np.ndarray, radius: int = 5) -> np.ndarray:
     if mask.sum() == 0:
         return mask
     grid = np.arange(-radius, radius + 1)
@@ -62,25 +58,9 @@ def binary_dilation_keep_nearest(
     labeled, num = ndi.label(dilated)
     if num == 0:
         return np.zeros_like(mask, dtype=bool)
-
-    click_x, click_y = click_point
-    best_label = None
-    best_distance_sq = None
-
-    for label_idx in range(1, num + 1):
-        ys, xs = np.where(labeled == label_idx)
-        if len(xs) == 0:
-            continue
-        distances_sq = (xs - click_x) ** 2 + (ys - click_y) ** 2
-        min_distance_sq = float(distances_sq.min())
-        if best_distance_sq is None or min_distance_sq < best_distance_sq:
-            best_distance_sq = min_distance_sq
-            best_label = label_idx
-
-    if best_label is None:
-        return np.zeros_like(mask, dtype=bool)
-
-    return labeled == best_label
+    sizes = ndi.sum(np.ones_like(mask, dtype=np.int32), labels=labeled, index=range(1, num + 1))
+    largest_idx = int(np.argmax(sizes)) + 1
+    return labeled == largest_idx
 
 
 def remove_overlap(mask: np.ndarray, reference: np.ndarray) -> np.ndarray:
@@ -88,13 +68,12 @@ def remove_overlap(mask: np.ndarray, reference: np.ndarray) -> np.ndarray:
 
 
 def greedy_circle_centers(
-    band_mask: np.ndarray,
-    min_center_dist: int,
-    rng: np.random.Generator,
-    existing: List[Tuple[int, int]] | None = None,
+        band_mask: np.ndarray,
+        min_center_dist: int,
+        rng: np.random.Generator,
+        existing: List[Tuple[int, int]] | None = None,
 ) -> List[Tuple[int, int]]:
     ys, xs = np.where(band_mask)
-    # 为了避免按扫描顺序导致的局部堆积，随机打乱候选点顺序
     order = rng.permutation(len(xs))
     centers: List[Tuple[int, int]] = []
     existing = existing or []
@@ -107,33 +86,19 @@ def greedy_circle_centers(
 
 
 def plan_circle_layout(
-    gt1_mask: np.ndarray,
-    gt2_mask: np.ndarray,
-    radius: int,
-    spacing: int,
+        gt1_mask: np.ndarray,
+        gt2_mask: np.ndarray,
+        radius: int,
+        spacing: int,
 ) -> List[Tuple[int, int]]:
-    """
-    沿着 gt_2 中与 gt_1 相邻的边界，在 gt_2 内布置三圈蓝色圆形。
-
-    逻辑：
-    1. 找到 gt_2 与 gt_1 相邻的边界像素（在 gt_2 内，且 8 邻域接触 gt_1）。
-    2. 以该边界作为参考，计算 gt_2 内到边界的距离，并按距离分三圈取样。
-    3. 蓝色圆之间的最小间距基于圆边缘，因此圆心间距 = 直径 + 最小间距。
-    4. 仅在 gt_2 内放置圆形，不在 gt_1 内放置。
-    """
-
     if gt2_mask.sum() == 0 or gt1_mask.sum() == 0:
         return []
-
-    # 仅考虑 gt_2 内与 gt_1 相邻的边界区域
     adjacency = gt2_mask & ndi.binary_dilation(gt1_mask, structure=np.ones((3, 3)))
     if adjacency.sum() == 0:
         return []
-
-    # 计算到接触边界的距离（仅在 gt_2 内有效），并限制最大距离确保只有三圈
     dist = ndi.distance_transform_edt(~adjacency) * gt2_mask
-    effective_spacing = spacing + 2 * radius  # 圆心间距，保证圆边界间距为 spacing
-    max_distance = radius + 2 * effective_spacing + spacing  # 超过三圈的距离范围全部舍弃
+    effective_spacing = spacing + 2 * radius
+    max_distance = radius + 2 * effective_spacing + spacing
 
     centers: List[Tuple[int, int]] = []
     rng = np.random.default_rng(42)
@@ -143,14 +108,13 @@ def plan_circle_layout(
         target_base = radius + ring_idx * effective_spacing
         candidate_shifts = [-spacing // 2, 0, spacing // 2]
         best_ring_centers: List[Tuple[int, int]] = []
-
         for shift in candidate_shifts:
             target = max(radius, target_base + shift)
             band = (
-                (dist >= target - band_half_width)
-                & (dist <= target + band_half_width)
-                & (dist <= max_distance)
-                & gt2_mask
+                    (dist >= target - band_half_width)
+                    & (dist <= target + band_half_width)
+                    & (dist <= max_distance)
+                    & gt2_mask
             )
             if band.sum() == 0:
                 continue
@@ -162,7 +126,6 @@ def plan_circle_layout(
             )
             if len(new_centers) > len(best_ring_centers):
                 best_ring_centers = new_centers
-
         centers.extend(best_ring_centers)
     return centers
 
@@ -188,8 +151,11 @@ def infer_with_click(
         circle_diameter: int,
         circle_spacing: int,
 ) -> Tuple[np.ndarray, np.ndarray, Image.Image]:
+    """
+    执行单次推理的核心逻辑
+    """
     input_image = image.resize((1280, 1280), Image.BILINEAR)
-    # 注意：这里的 1240 可能是原代码的一个硬编码尺寸，确保和你的模型训练尺寸一致
+    # 坐标映射：从显示尺寸 (1240) 映射到 推理尺寸 (1280)
     click_scaled = (click_xy[0] / 1240 * 1280, click_xy[1] / 1240 * 1280)
     heatmap_np = generate_gaussian_heatmap(1280, 1280, click_scaled, sigma)
 
@@ -205,7 +171,7 @@ def infer_with_click(
     gt1 = (pred1_resized.squeeze().cpu().numpy() >= gt1_threshold)
     gt2 = (pred2_resized.squeeze().cpu().numpy() >= gt2_threshold)
 
-    gt1_processed = binary_dilation_keep_nearest(gt1, click_point=click_xy, radius=12)
+    gt1_processed = binary_dilation_keep_largest(gt1, radius=12)
     gt2_processed = remove_overlap(gt2, gt1_processed)
 
     centers = plan_circle_layout(
@@ -214,73 +180,35 @@ def infer_with_click(
         radius=circle_diameter // 2,
         spacing=circle_spacing,
     )
+    # 用于显示的图像尺寸是 1240
     resized_image = image.resize((1240, 1240), Image.BILINEAR)
     overlay = draw_circles_on_image(resized_image, centers, diameter=circle_diameter)
 
     return gt1_processed.astype(np.uint8), gt2_processed.astype(np.uint8), overlay
 
 
-def display_intermediate(image: Image.Image) -> Tuple[float, float]:
-    # ================= 修改处 2：优化显示逻辑 =================
-    print("正在打开图像窗口，请在病灶位置点击鼠标左键...")
-
-    # 启用交互模式，确保窗口不会阻塞导致假死（虽然 ginput 本身是阻塞的）
-    plt.ion()
-    fig = plt.figure("Input Image", figsize=(8, 8))
-    plt.imshow(image)
-    plt.axis("off")
-    plt.title("单击选择提示位置 (Click to select prompt)")
-
-    # 强制绘制一下，防止窗口空白
-    plt.draw()
-    plt.pause(0.1)
-
-    # 获取点击输入，timeout=0 表示无限等待直到点击
-    coords = plt.ginput(1, timeout=0, mouse_add=1, mouse_stop=None, mouse_pop=None)
-
-    plt.close(fig)
-    plt.ioff()  # 关闭交互模式
-    # =======================================================
-
-    if not coords:
-        raise RuntimeError("未检测到点击，或者窗口被直接关闭。请重新运行并点击图像。")
-
-    print(f"捕获点击坐标: {coords[0]}")
-    return coords[0]
-
-
-def visualize_results(gt1: np.ndarray, gt2: np.ndarray, overlay: Image.Image):
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-    axes[0].imshow(gt1, cmap="gray")
-    axes[0].set_title("gt_1 后处理")
-    axes[1].imshow(gt2, cmap="gray")
-    axes[1].set_title("gt_2 去重叠")
-    axes[2].imshow(overlay)
-    axes[2].set_title("gt_2 蓝色圆形标注")
-    for ax in axes:
-        ax.axis("off")
-    plt.tight_layout()
-    plt.show()
-
-
-def save_outputs(gt1: np.ndarray, gt2: np.ndarray, overlay: Image.Image, output_dir: Path, stem: str):
+def save_outputs(gt1: np.ndarray, gt2: np.ndarray, overlay: Image.Image, output_dir: Path, stem: str, click_idx: int):
     output_dir.mkdir(parents=True, exist_ok=True)
     gt1_img = Image.fromarray(gt1 * 255)
     gt2_img = Image.fromarray(gt2 * 255)
-    gt1_path = output_dir / f"{stem}_gt_1.png"
-    gt2_path = output_dir / f"{stem}_gt_2.png"
-    overlay_path = output_dir / f"{stem}_gt_2_overlay.png"
+
+    # 加上 click_idx 以区分同一次运行中的多次点击
+    gt1_path = output_dir / f"{stem}_click{click_idx}_gt_1.png"
+    gt2_path = output_dir / f"{stem}_click{click_idx}_gt_2.png"
+    overlay_path = output_dir / f"{stem}_click{click_idx}_overlay.png"
+
     gt1_img.save(gt1_path)
     gt2_img.save(gt2_path)
     overlay.save(overlay_path)
-    print(f"保存 gt_1 至 {gt1_path}")
-    print(f"保存 gt_2 至 {gt2_path}")
-    print(f"保存带圆形标注的 gt_2 至 {overlay_path}")
+    print(f"--> 结果已保存至: {output_dir}")
 
+
+# ==========================================
+# 第二部分：交互逻辑 (修改为旧代码的 Event 模式)
+# ==========================================
 
 def main():
     parser = argparse.ArgumentParser(description="交互式点击预测并生成后处理分割结果")
-    # 请确保这里的路径是你本地实际存在的路径
     parser.add_argument("--model-path", default=r"C:\work space\liekoong\predict\best_model.pth", help="模型权重路径")
 
 
@@ -299,17 +227,11 @@ def main():
     parser.add_argument("--gt2-threshold", type=float, default=0.4, help="gt_2 阈值")
     parser.add_argument("--sigma", type=float, default=15.0, help="点击生成高斯热图的标准差")
     parser.add_argument("--circle-diameter", type=int, default=15, help="绘制蓝色圆的直径")
-    parser.add_argument(
-        "--circle-spacing",
-        type=int,
-        default=10,
-        help="蓝色圆之间的最小边界间距（像素）",
-    )
+    parser.add_argument("--circle-spacing", type=int, default=5, help="蓝色圆之间的最小边界间距（像素）")
     args = parser.parse_args()
 
     device = torch.device(args.device) if args.device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # 简单的文件存在性检查
     if not os.path.exists(args.model_path):
         print(f"Error: 模型文件不存在: {args.model_path}")
         return
@@ -317,31 +239,83 @@ def main():
         print(f"Error: 图像文件不存在: {args.image_path}")
         return
 
+    # 1. 加载模型和图像
+    print("正在加载模型和图像...")
     model = load_model(args.model_path, device)
 
-    image = Image.open(args.image_path).convert("RGB")
-    display_image = image.resize((1240, 1240), Image.BILINEAR)
+    original_pil = Image.open(args.image_path).convert("RGB")
+    # 统一显示尺寸，与新代码逻辑保持一致 (1240x1240)
+    display_pil = original_pil.resize((1240, 1240), Image.BILINEAR)
+    display_np = np.array(display_pil)
 
-    # 这一步会弹出窗口等待点击
-    click_xy = display_intermediate(display_image)
+    # 2. 创建主交互窗口
+    fig, ax = plt.subplots(figsize=(8, 8))
+    ax.imshow(display_np)
+    ax.set_title("请在病灶位置点击 (Click to Segment)", fontsize=14)
+    ax.axis("off")
 
-    gt1, gt2, overlay = infer_with_click(
-        model=model,
-        image=image,
-        click_xy=click_xy,
-        sigma=args.sigma,
-        device=device,
-        gt1_threshold=args.gt1_threshold,
-        gt2_threshold=args.gt2_threshold,
-        circle_diameter=args.circle_diameter,
-        circle_spacing=args.circle_spacing,
-    )
-
-    visualize_results(gt1, gt2, overlay)
-
+    # 3. 定义状态字典，用于在多次点击间保持计数
+    state = {"click_count": 0}
     output_dir = Path(args.output_dir)
     stem = Path(args.image_path).stem
-    save_outputs(gt1, gt2, overlay, output_dir, stem)
+
+    # 4. 定义回调函数 (核心修改：每次点击都会触发此函数，而不是线性执行)
+    def on_click(event):
+        # 排除无效点击（如点击了工具栏区域）
+        if event.inaxes != ax:
+            return
+
+        # 获取坐标
+        x, y = event.xdata, event.ydata
+        state["click_count"] += 1
+        print(f"\n[第 {state['click_count']} 次点击] 坐标: ({x:.1f}, {y:.1f})，正在推理...")
+
+        # 调用核心推理逻辑
+        try:
+            gt1, gt2, overlay = infer_with_click(
+                model=model,
+                image=original_pil,
+                click_xy=(x, y),
+                sigma=args.sigma,
+                device=device,
+                gt1_threshold=args.gt1_threshold,
+                gt2_threshold=args.gt2_threshold,
+                circle_diameter=args.circle_diameter,
+                circle_spacing=args.circle_spacing,
+            )
+        except Exception as e:
+            print(f"推理出错: {e}")
+            return
+
+        # 保存结果
+        save_outputs(gt1, gt2, overlay, output_dir, stem, state["click_count"])
+
+        # 弹出新的窗口显示结果 (模仿旧代码的行为)
+        res_fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+        res_fig.canvas.manager.set_window_title(f"Result - Click {state['click_count']}")
+
+        axes[0].imshow(gt1, cmap="gray")
+        axes[0].set_title("Mask 1 (Core)")
+
+        axes[1].imshow(gt2, cmap="gray")
+        axes[1].set_title("Mask 2 (Surround)")
+
+        axes[2].imshow(overlay)
+        axes[2].set_title("Overlay with Plan")
+
+        for a in axes:
+            a.axis("off")
+
+        plt.tight_layout()
+        plt.show()  # 这会显示结果窗口，关闭结果窗口后，主窗口依然可用
+
+    # 5. 绑定事件并启动
+    cid = fig.canvas.mpl_connect('button_press_event', on_click)
+    print("窗口已就绪。请点击图像进行分割。关闭主窗口以退出程序。")
+    plt.show()
+
+    # 程序结束时断开连接（可选）
+    fig.canvas.mpl_disconnect(cid)
 
 
 if __name__ == "__main__":
