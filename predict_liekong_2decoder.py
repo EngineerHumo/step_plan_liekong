@@ -187,7 +187,7 @@ def infer_with_click(
         gt2_threshold: float,
         circle_diameter: int,
         circle_spacing: int,
-) -> Tuple[np.ndarray, np.ndarray, Image.Image]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Image.Image]:
     input_image = image.resize((1280, 1280), Image.BILINEAR)
     # 注意：这里的 1240 可能是原代码的一个硬编码尺寸，确保和你的模型训练尺寸一致
     click_scaled = (click_xy[0] / 1240 * 1280, click_xy[1] / 1240 * 1280)
@@ -202,10 +202,10 @@ def infer_with_click(
     pred1_resized = F.interpolate(pred1, size=(1240, 1240), mode="bilinear", align_corners=False)
     pred2_resized = F.interpolate(pred2, size=(1240, 1240), mode="bilinear", align_corners=False)
 
-    gt1 = (pred1_resized.squeeze().cpu().numpy() >= gt1_threshold)
+    gt1_raw = (pred1_resized.squeeze().cpu().numpy() >= gt1_threshold)
     gt2 = (pred2_resized.squeeze().cpu().numpy() >= gt2_threshold)
 
-    gt1_processed = binary_dilation_keep_nearest(gt1, click_point=click_xy, radius=12)
+    gt1_processed = binary_dilation_keep_nearest(gt1_raw, click_point=click_xy, radius=12)
     gt2_processed = remove_overlap(gt2, gt1_processed)
 
     centers = plan_circle_layout(
@@ -217,7 +217,12 @@ def infer_with_click(
     resized_image = image.resize((1240, 1240), Image.BILINEAR)
     overlay = draw_circles_on_image(resized_image, centers, diameter=circle_diameter)
 
-    return gt1_processed.astype(np.uint8), gt2_processed.astype(np.uint8), overlay
+    return (
+        gt1_raw.astype(np.uint8),
+        gt1_processed.astype(np.uint8),
+        gt2_processed.astype(np.uint8),
+        overlay,
+    )
 
 
 def display_intermediate(image: Image.Image) -> Tuple[float, float]:
@@ -249,31 +254,46 @@ def display_intermediate(image: Image.Image) -> Tuple[float, float]:
     return coords[0]
 
 
-def visualize_results(gt1: np.ndarray, gt2: np.ndarray, overlay: Image.Image):
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-    axes[0].imshow(gt1, cmap="gray")
-    axes[0].set_title("gt_1 后处理")
-    axes[1].imshow(gt2, cmap="gray")
-    axes[1].set_title("gt_2 去重叠")
-    axes[2].imshow(overlay)
-    axes[2].set_title("gt_2 蓝色圆形标注")
+def visualize_results(
+    gt1_raw: np.ndarray, gt1_processed: np.ndarray, gt2: np.ndarray, overlay: Image.Image
+):
+    fig, axes = plt.subplots(1, 4, figsize=(20, 5))
+    axes[0].imshow(gt1_raw, cmap="gray")
+    axes[0].set_title("gt_1 阈值结果")
+    axes[1].imshow(gt1_processed, cmap="gray")
+    axes[1].set_title("gt_1 后处理")
+    axes[2].imshow(gt2, cmap="gray")
+    axes[2].set_title("gt_2 去重叠")
+    axes[3].imshow(overlay)
+    axes[3].set_title("gt_2 蓝色圆形标注")
     for ax in axes:
         ax.axis("off")
     plt.tight_layout()
     plt.show()
 
 
-def save_outputs(gt1: np.ndarray, gt2: np.ndarray, overlay: Image.Image, output_dir: Path, stem: str):
+def save_outputs(
+    gt1_raw: np.ndarray,
+    gt1_processed: np.ndarray,
+    gt2: np.ndarray,
+    overlay: Image.Image,
+    output_dir: Path,
+    stem: str,
+):
     output_dir.mkdir(parents=True, exist_ok=True)
-    gt1_img = Image.fromarray(gt1 * 255)
+    gt1_raw_img = Image.fromarray(gt1_raw * 255)
+    gt1_processed_img = Image.fromarray(gt1_processed * 255)
     gt2_img = Image.fromarray(gt2 * 255)
-    gt1_path = output_dir / f"{stem}_gt_1.png"
+    gt1_raw_path = output_dir / f"{stem}_gt_1_raw.png"
+    gt1_processed_path = output_dir / f"{stem}_gt_1.png"
     gt2_path = output_dir / f"{stem}_gt_2.png"
     overlay_path = output_dir / f"{stem}_gt_2_overlay.png"
-    gt1_img.save(gt1_path)
+    gt1_raw_img.save(gt1_raw_path)
+    gt1_processed_img.save(gt1_processed_path)
     gt2_img.save(gt2_path)
     overlay.save(overlay_path)
-    print(f"保存 gt_1 至 {gt1_path}")
+    print(f"保存原始 gt_1 阈值结果至 {gt1_raw_path}")
+    print(f"保存 gt_1 后处理结果至 {gt1_processed_path}")
     print(f"保存 gt_2 至 {gt2_path}")
     print(f"保存带圆形标注的 gt_2 至 {overlay_path}")
 
@@ -325,7 +345,7 @@ def main():
     # 这一步会弹出窗口等待点击
     click_xy = display_intermediate(display_image)
 
-    gt1, gt2, overlay = infer_with_click(
+    gt1_raw, gt1_processed, gt2, overlay = infer_with_click(
         model=model,
         image=image,
         click_xy=click_xy,
@@ -337,11 +357,11 @@ def main():
         circle_spacing=args.circle_spacing,
     )
 
-    visualize_results(gt1, gt2, overlay)
+    visualize_results(gt1_raw, gt1_processed, gt2, overlay)
 
     output_dir = Path(args.output_dir)
     stem = Path(args.image_path).stem
-    save_outputs(gt1, gt2, overlay, output_dir, stem)
+    save_outputs(gt1_raw, gt1_processed, gt2, overlay, output_dir, stem)
 
 
 if __name__ == "__main__":
