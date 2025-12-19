@@ -200,7 +200,7 @@ def connect_close_components(mask: np.ndarray, max_distance: float = 100.0) -> n
 def infer_with_click(
     model: PRPSegmenter,
     image: Image.Image,
-    click_xy: Tuple[float, float],
+    click_xy: Tuple[float, float] | None,
     sigma: float,
     device: torch.device,
     gt1_threshold: float,
@@ -209,9 +209,12 @@ def infer_with_click(
     circle_spacing: int,
 ) -> Tuple[np.ndarray, Image.Image]:
     input_image = image.resize((1280, 1280), Image.BILINEAR)
-    # 注意：这里的 1240 可能是原代码的一个硬编码尺寸，确保和你的模型训练尺寸一致
-    click_scaled = (click_xy[0] / 1240 * 1280, click_xy[1] / 1240 * 1280)
-    heatmap_np = generate_gaussian_heatmap(1280, 1280, click_scaled, sigma)
+    if click_xy is None:
+        heatmap_np = np.zeros((1280, 1280), dtype=np.float32)
+    else:
+        # 注意：这里的 1240 可能是原代码的一个硬编码尺寸，确保和你的模型训练尺寸一致
+        click_scaled = (click_xy[0] / 1240 * 1280, click_xy[1] / 1240 * 1280)
+        heatmap_np = generate_gaussian_heatmap(1280, 1280, click_scaled, sigma)
 
     image_tensor = pil_to_tensor(input_image).unsqueeze(0).to(device)
     heatmap_tensor = torch.from_numpy(heatmap_np).unsqueeze(0).unsqueeze(0).to(device)
@@ -305,7 +308,7 @@ def save_outputs(gt1: np.ndarray, overlay: Image.Image, output_dir: Path, stem: 
 def main():
     parser = argparse.ArgumentParser(description="交互式点击预测并生成后处理分割结果")
     parser.add_argument("--model-path", required=True, help="模型权重路径")
-    parser.add_argument("--image-path", required=True, help="待预测图像路径")
+    parser.add_argument("--image-path", required=True, help="待预测图像路径或目录")
     parser.add_argument("--output-dir", default="outputs", help="输出保存目录")
     parser.add_argument("--device", default=None, help="使用的设备，如 cuda:0 或 cpu")
     parser.add_argument("--gt1-threshold", type=float, default=0.5, help="gt_1 阈值")
@@ -330,51 +333,93 @@ def main():
     if not os.path.exists(args.model_path):
         print(f"Error: 模型文件不存在: {args.model_path}")
         return
-    if not os.path.exists(args.image_path):
+    image_path = Path(args.image_path)
+    if not image_path.exists():
         print(f"Error: 图像文件不存在: {args.image_path}")
         return
 
+    if image_path.is_dir():
+        image_files = sorted(
+            [
+                p
+                for p in image_path.iterdir()
+                if p.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp", ".tiff"}
+            ]
+        )
+    else:
+        image_files = [image_path]
+
+    if not image_files:
+        print(f"Error: 在目录 {image_path} 中未找到可用图像。")
+        return
+
     model = load_model(args.model_path, device)
-    image = Image.open(args.image_path).convert("RGB")
-    display_image = image.resize((1240, 1240), Image.BILINEAR)
 
-    result_fig: plt.Figure | None = None
+    for img_idx, img_path in enumerate(image_files):
+        print(f"\n正在处理第 {img_idx + 1}/{len(image_files)} 张图像: {img_path}")
+        image = Image.open(img_path).convert("RGB")
+        display_image = image.resize((1240, 1240), Image.BILINEAR)
 
-    def handle_click(event, *, on_infer: Callable):
-        nonlocal result_fig
-        if event.inaxes is None or event.button != 1:
-            return
-        click_xy = (event.xdata, event.ydata)
-        print(f"捕获点击坐标: {click_xy}")
-        gt1, overlay = on_infer(click_xy)
-        result_fig = visualize_results(display_image, gt1, overlay, result_fig)
-        stem = Path(args.image_path).stem
-        save_outputs(gt1, overlay, Path(args.output_dir), stem)
+        result_figs: List[plt.Figure] = []
+        click_counter = 0
 
-    def run_inference(click_xy: Tuple[float, float]):
-        return infer_with_click(
-            model=model,
-            image=image,
-            click_xy=click_xy,
-            sigma=args.sigma,
-            device=device,
-            gt1_threshold=args.gt1_threshold,
-            confidence_threshold=args.confidence_threshold,
-            circle_diameter=args.circle_diameter,
-            circle_spacing=args.circle_spacing,
+        def save_and_show(gt1: np.ndarray, overlay: Image.Image, suffix: str):
+            fig = visualize_results(display_image, gt1, overlay, fig=None)
+            result_figs.append(fig)
+            stem = f"{img_path.stem}_{suffix}"
+            save_outputs(gt1, overlay, Path(args.output_dir), stem)
+
+        def handle_click(event, *, on_infer: Callable[[Tuple[float, float]], Tuple[np.ndarray, Image.Image]]):
+            nonlocal click_counter
+            if event.inaxes is None or event.button != 1:
+                return
+            click_xy = (event.xdata, event.ydata)
+            print(f"捕获点击坐标: {click_xy}")
+            gt1, overlay = on_infer(click_xy)
+            suffix = f"click_{click_counter}"
+            click_counter += 1
+            save_and_show(gt1, overlay, suffix)
+
+        def run_inference(click_xy: Tuple[float, float] | None):
+            return infer_with_click(
+                model=model,
+                image=image,
+                click_xy=click_xy,
+                sigma=args.sigma,
+                device=device,
+                gt1_threshold=args.gt1_threshold,
+                confidence_threshold=args.confidence_threshold,
+                circle_diameter=args.circle_diameter,
+                circle_spacing=args.circle_spacing,
+            )
+
+        # 初次推理：无需点击，输入全黑高斯热图
+        print("执行自动推理（无点击，高斯热图全黑）...")
+        auto_gt1, auto_overlay = run_inference(None)
+        save_and_show(auto_gt1, auto_overlay, "auto")
+
+        main_fig = plt.figure("Input Image", figsize=(8, 8))
+        ax = main_fig.add_subplot(111)
+        ax.imshow(display_image)
+        ax.axis("off")
+        ax.set_title("单击选择提示位置 (Click to select prompt)")
+
+        main_fig.canvas.mpl_connect(
+            "button_press_event",
+            lambda event: handle_click(event, on_infer=lambda xy: run_inference(xy)),
         )
 
-    fig = plt.figure("Input Image", figsize=(8, 8))
-    ax = fig.add_subplot(111)
-    ax.imshow(display_image)
-    ax.axis("off")
-    ax.set_title("单击选择提示位置 (Click to select prompt)")
-    cid = fig.canvas.mpl_connect(
-        "button_press_event",
-        lambda event: handle_click(event, on_infer=run_inference),
-    )
-    print("图像窗口已打开，监听点击事件。单击以运行预测，窗口不会因一次点击而关闭。")
-    plt.show()
+        def on_main_close(event):
+            if event.canvas.figure is main_fig:
+                for fig in result_figs:
+                    if plt.fignum_exists(fig.number):
+                        plt.close(fig)
+
+        main_fig.canvas.mpl_connect("close_event", on_main_close)
+
+        print("图像窗口已打开，监听点击事件。单击以运行预测，窗口不会因一次点击而关闭。关闭窗口后将处理下一张图像。")
+        plt.show()
+        plt.close("all")
 
 
 if __name__ == "__main__":
