@@ -1,6 +1,6 @@
 import argparse
 import os
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -17,7 +17,7 @@ from utils import dice_coefficient, iou_score
 def default_device() -> str:
     """Prefer CUDA when available, defaulting to GPU 0 for multi-GPU training."""
     if torch.cuda.is_available():
-        return "cuda:1"              ###同步修改
+        return "cuda:0"
     return "cpu"
 
 
@@ -79,11 +79,53 @@ def save_validation_batch(
         cv2.imwrite(os.path.join(epoch_dir, f"{basename}_gt1.png"), gt1_mask)
 
 
-def dice_bce_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+def compute_distance_weights(heatmaps: torch.Tensor) -> torch.Tensor:
+    """Compute per-pixel weights based on distance to the click point.
+
+    The closest error pixels receive a weight of ``0.3`` while the farthest
+    error pixels receive a weight of ``3.0``. Intermediate pixels are linearly
+    interpolated between these bounds based on their normalized Euclidean
+    distance to the click position extracted from ``heatmaps``.
+    """
+
+    if heatmaps.dim() != 4 or heatmaps.shape[1] != 1:
+        raise ValueError("heatmaps must be a 4D tensor with a single channel")
+
+    b, _, h, w = heatmaps.shape
+    flat_indices = heatmaps.flatten(2).argmax(dim=2)
+    click_y = flat_indices // w
+    click_x = flat_indices % w
+
+    grid_y, grid_x = torch.meshgrid(
+        torch.arange(h, device=heatmaps.device, dtype=heatmaps.dtype),
+        torch.arange(w, device=heatmaps.device, dtype=heatmaps.dtype),
+        indexing="ij",
+    )
+
+    grid_y = grid_y.unsqueeze(0).expand(b, -1, -1)
+    grid_x = grid_x.unsqueeze(0).expand(b, -1, -1)
+
+    dist = torch.sqrt((grid_y - click_y.unsqueeze(-1).unsqueeze(-1)) ** 2 + (grid_x - click_x.unsqueeze(-1).unsqueeze(-1)) ** 2)
+    dist_max = dist.amax(dim=(1, 2), keepdim=True).clamp(min=1e-6)
+    normalized = dist / dist_max
+
+    min_w, max_w = 0.3, 3.0
+    weights = min_w + (max_w - min_w) * normalized
+    return weights.unsqueeze(1)
+
+
+def weighted_dice_bce_loss(pred: torch.Tensor, target: torch.Tensor, heatmap: torch.Tensor) -> torch.Tensor:
+    """Dice + BCE loss with spatial weighting from click distance."""
+
     pred = pred.clamp(min=1e-6, max=1 - 1e-6)
-    dice = dice_coefficient(pred, target).mean()
-    bce = nn.functional.binary_cross_entropy(pred, target)
-    return (1 - dice) + 0.5 * bce
+    weights = compute_distance_weights(heatmap)
+
+    intersection = (weights * pred * target).sum(dim=(1, 2, 3))
+    union = (weights * pred).sum(dim=(1, 2, 3)) + (weights * target).sum(dim=(1, 2, 3))
+    dice = (2 * intersection + 1e-6) / (union + 1e-6)
+
+    weighted_bce = nn.functional.binary_cross_entropy(pred, target, weight=weights, reduction="sum") / weights.sum()
+    return (1 - dice).mean() + 0.5 * weighted_bce
 
 
 def evaluate(
@@ -144,7 +186,7 @@ def train(
     model = PRPSegmenter()
     if torch.cuda.device_count() > 1 and device.type == "cuda":
         print("Using DataParallel on GPUs: 0 and 1")
-        model = nn.DataParallel(model, device_ids=[1])
+        model = nn.DataParallel(model, device_ids=[0, 1])
     model = model.to(device)
     optimizer = AdamW(model.parameters(), lr=lr)
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs)
@@ -161,6 +203,7 @@ def train(
     ensure_dir(output_dir)
     best_val_dice = float("-inf")
     best_epoch: Optional[int] = None
+    val_history: List[tuple[int, float]] = []
 
     for epoch in range(1, epochs + 1):
         epoch_loss = 0.0
@@ -201,7 +244,7 @@ def train(
             masks1 = masks1.to(device)
 
             preds1 = model(images, heatmaps)
-            loss = dice_bce_loss(preds1, masks1)
+            loss = weighted_dice_bce_loss(preds1, masks1, heatmaps)
 
             optimizer.zero_grad()
             loss.backward()
@@ -230,6 +273,8 @@ def train(
             val_dice, val_iou = evaluate(eval_model, val_loader, device, save_root=val_save_dir, epoch=epoch)
             print(f"Epoch {epoch}: Val Dice={val_dice:.4f} | Val IoU={val_iou:.4f}")
 
+            val_history.append((epoch, val_dice))
+
             if val_dice > best_val_dice:
                 best_val_dice = val_dice
                 best_epoch = epoch
@@ -247,6 +292,10 @@ def train(
 
     if best_epoch is not None:
         print(f"Best validation model was achieved at epoch {best_epoch} with Dice {best_val_dice:.4f}")
+        if val_history:
+            top_epochs = sorted(val_history, key=lambda x: x[1], reverse=True)[:10]
+            epoch_names = [f"epoch_{epoch:03d}" for epoch, _ in top_epochs]
+            print("Top 10 validation epochs:", ", ".join(epoch_names))
     else:
         print("Validation was not run; no best epoch to report.")
 
@@ -256,7 +305,7 @@ def parse_args():
     parser.add_argument("--train_dir", type=str, default="dataset_liekong/train", help="Path to training dataset")
     parser.add_argument("--val_dir", type=str, default="dataset_liekong/val", help="Path to validation dataset")
     parser.add_argument("--epochs", type=int, default=400)
-    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=6e-4)
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--device", type=str, default=default_device())
