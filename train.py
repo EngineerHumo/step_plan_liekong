@@ -54,11 +54,16 @@ def save_validation_batch(
         mask1_np = masks1[i, 0].detach().cpu().numpy()
         pred1_np = preds1[i, 0].detach().cpu().numpy()
 
-        click_y, click_x = divmod(heatmap_np.argmax(), heatmap_np.shape[1])
-        scale_y = original_size[0] / heatmap_np.shape[0]
-        scale_x = original_size[1] / heatmap_np.shape[1]
-        click_y_resized = int(click_y * scale_y)
-        click_x_resized = int(click_x * scale_x)
+        has_click = heatmap_np.max() > 0
+        if has_click:
+            click_y, click_x = divmod(heatmap_np.argmax(), heatmap_np.shape[1])
+            scale_y = original_size[0] / heatmap_np.shape[0]
+            scale_x = original_size[1] / heatmap_np.shape[1]
+            click_y_resized = int(click_y * scale_y)
+            click_x_resized = int(click_x * scale_x)
+        else:
+            click_y_resized = None
+            click_x_resized = None
 
         image_resized = cv2.resize(image_np, (original_size[1], original_size[0]))
         heatmap_resized = cv2.resize(heatmap_np, (original_size[1], original_size[0]))
@@ -66,7 +71,25 @@ def save_validation_batch(
         pred1_resized = cv2.resize(pred1_np, (original_size[1], original_size[0]))
 
         image_with_click = image_resized.copy()
-        cv2.circle(image_with_click, (int(click_x_resized), int(click_y_resized)), 8, (255, 0, 0), thickness=-1)
+        if has_click and click_x_resized is not None and click_y_resized is not None:
+            cv2.circle(
+                image_with_click,
+                (int(click_x_resized), int(click_y_resized)),
+                8,
+                (255, 0, 0),
+                thickness=-1,
+            )
+        else:
+            cv2.putText(
+                image_with_click,
+                "no_click",
+                (15, 40),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1.0,
+                (255, 0, 0),
+                2,
+                lineType=cv2.LINE_AA,
+            )
 
         pred1_mask = (pred1_resized > 0.5).astype(np.uint8) * 255
         gt1_mask = (mask1_resized > 0.5).astype(np.uint8) * 255
