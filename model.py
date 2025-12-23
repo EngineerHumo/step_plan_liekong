@@ -32,7 +32,7 @@ class CrossAttentionFusion(nn.Module):
         self.q_proj = nn.Conv2d(channels, channels, kernel_size=1)
         self.k_proj = nn.Conv2d(channels, channels, kernel_size=1)
         self.v_proj = nn.Conv2d(channels, channels, kernel_size=1)
-        self.gamma = nn.Parameter(torch.tensor(0.5))
+        self.gamma = nn.Parameter(torch.tensor(0.1))
 
     def forward(self, prompt_feat: torch.Tensor, image_feat: torch.Tensor) -> torch.Tensor:
         """
@@ -150,21 +150,6 @@ class PRPSegmenter(nn.Module):
         self.attention = CrossAttentionFusion(channels=512)
         self.vit_refiner = ViTFeatureRefiner(channels=512, num_layers=2, num_heads=8)
 
-        self.prompt_residual = nn.Sequential(
-            nn.Conv2d(512, 512, kernel_size=1),
-            nn.BatchNorm2d(512),
-            nn.ReLU(inplace=True),
-        )
-
-        self.gate_low = nn.Sequential(
-            nn.Conv2d(1, 64, kernel_size=1),
-            nn.Sigmoid(),
-        )
-        self.gate_mid = nn.Sequential(
-            nn.Conv2d(1, 64, kernel_size=1),
-            nn.Sigmoid(),
-        )
-
         self.decoder = UNetDecoder(
             encoder_channels=[64, 64, 128, 256, 512]
         )
@@ -180,15 +165,7 @@ class PRPSegmenter(nn.Module):
         prompt_feat = F.interpolate(prompt_feat, size=x5.shape[2:], mode="bilinear", align_corners=False)
 
         fused = self.attention(prompt_feat, x5)
-        fused = fused + 0.2 * self.prompt_residual(prompt_feat)
         fused = self.vit_refiner(fused)
-
-        # Prompt-aware gating on shallow features to ensure click influence
-        heat_low = F.interpolate(heatmap, size=x1.shape[2:], mode="bilinear", align_corners=False)
-        heat_mid = F.interpolate(heatmap, size=x2.shape[2:], mode="bilinear", align_corners=False)
-
-        x1 = x1 * (1 + self.gate_low(heat_low))
-        x2 = x2 * (1 + self.gate_mid(heat_mid))
 
         logits = self.decoder([x1, x2, x3, x4, fused])
         logits = F.interpolate(logits, size=image.shape[2:], mode="bilinear", align_corners=False)
